@@ -1,0 +1,622 @@
+#define DUCKDB_EXTENSION_MAIN
+
+#include "geobench_extension.hpp"
+#include "duckdb.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/extension_util.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+
+//======================================================================================================================
+// Util
+//======================================================================================================================
+namespace duckdb {
+namespace {
+
+class BinaryReader {
+public:
+	BinaryReader(const char* data, size_t size)
+	    : beg(data), ptr(data), end(data + size) {}
+
+	const char* Reserve(size_t size) {
+		if (ptr + size > end) {
+			throw InvalidInputException("BinaryReader: Attempt to reserve past end of buffer");
+		}
+		const char* result = ptr;
+		ptr += size;
+		return result;
+	}
+
+	void Skip(size_t size) {
+		if (ptr + size > end) {
+			throw InvalidInputException("BinaryReader: Attempt to skip past end of buffer");
+		}
+		ptr += size;
+	}
+
+	template<class T, bool IS_BIG_ENDIAN = false>
+	T Read() {
+		if (ptr + sizeof(T) > end) {
+			throw InvalidInputException("BinaryReader: Attempt to read past end of buffer");
+		}
+
+		T value;
+
+		if (!IS_BIG_ENDIAN) {
+			memcpy(&value, ptr, sizeof(T));
+		} else {
+			// Handle big-endian reading
+			char buffer[sizeof(T)];
+			for (size_t i = 0; i < sizeof(T); i++) {
+				buffer[i] = ptr[sizeof(T) - 1 - i];
+			}
+			memcpy(&value, buffer, sizeof(T));
+		}
+
+		ptr += sizeof(T);
+
+		return value;
+	}
+
+	template<class T>
+	T Read(bool is_big_endian) {
+		return is_big_endian ? Read<T, true>() : Read<T, false>();
+	}
+
+private:
+	const char* beg;
+	const char* ptr;
+	const char* end;
+};
+
+class BinaryWriter {
+public:
+	template<class T>
+	void Write(const T& value) {
+		static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
+		const auto offset = buffer.size();
+		buffer.resize(buffer.size() + sizeof(T));
+		memcpy(buffer.data() + offset, &value, sizeof(T));
+	}
+
+	void Reserve(size_t size) {
+		buffer.reserve(buffer.size() + size);
+	}
+
+	void Copy(const char* data, size_t size) {
+		buffer.insert(buffer.end(), data, data + size);
+	}
+	void Reset() {
+		buffer.clear();
+	}
+	const char* GetData() const {
+		return buffer.data();
+	}
+	size_t GetSize() const {
+		return buffer.size();
+	}
+private:
+	vector<char> buffer;
+};
+
+
+
+// Geometry Type Enum
+enum class GeometryType : uint8_t {
+	INVALID = 0,
+	POINT = 1,
+	LINESTRING = 2,
+	POLYGON = 3,
+	MULTIPOINT = 4,
+	MULTILINESTRING = 5,
+	MULTIPOLYGON = 6,
+	GEOMETRYCOLLECTION = 7,
+};
+
+enum class VertexType : uint8_t {
+	XY = 0,
+	XYZ = 1,
+	XYM = 2,
+	XYZM = 3,
+};
+
+struct VertexXY {
+	static constexpr auto TYPE = VertexType::XY;
+	static constexpr auto HAS_Z = false;
+	static constexpr auto HAS_M = false;
+	double x;
+	double y;
+};
+
+struct VertexXYZ {
+	static constexpr auto TYPE = VertexType::XYZ;
+	static constexpr auto HAS_Z = true;
+	static constexpr auto HAS_M = false;
+	double x;
+	double y;
+	double z;
+};
+
+struct VertexXYM {
+	static constexpr auto TYPE = VertexType::XYM;
+	static constexpr auto HAS_Z = false;
+	static constexpr auto HAS_M = true;
+	double x;
+	double y;
+	double m;
+
+};
+
+struct VertexXYZM {
+	static constexpr auto TYPE = VertexType::XYZM;
+	static constexpr auto HAS_Z = true;
+	static constexpr auto HAS_M = true;
+	double x;
+	double y;
+	double z;
+	double m;
+};
+
+} // namespace
+} // namespace duckdb
+//======================================================================================================================
+// Types
+//======================================================================================================================
+namespace duckdb {
+namespace {
+
+struct Types {
+
+	// "Well Known Binary" (WKB) Geometry Type
+	static LogicalType WKB() {
+		auto ltype = LogicalType(LogicalTypeId::BLOB);
+		ltype.SetAlias("WKB");
+		return ltype;
+	}
+
+	// "Better Known Binary" (BKB) Geometry Type
+	static LogicalType BKB() {
+		auto ltype = LogicalType(LogicalTypeId::BLOB);
+		ltype.SetAlias("BKB");
+		return ltype;
+	}
+
+	static void Register(DatabaseInstance &db) {
+		ExtensionUtil::RegisterType(db, "WKB", WKB());
+		ExtensionUtil::RegisterType(db, "BKB", BKB());
+	}
+};
+
+} // namespace
+} // namespace duckdb
+//======================================================================================================================
+// Visitor
+//======================================================================================================================
+namespace duckdb {
+namespace {
+
+struct Tags {
+	struct Any {};
+
+	struct Simple : Any {};
+	struct Complex : Any {};
+
+	struct Point : Simple {};
+	struct Line : Simple {};
+	struct Ring : Simple {};
+
+	struct Polygon : Complex {};
+	struct Multi : Complex {};
+
+	struct MultiPolygon : Multi {};
+	struct MultiPoint : Multi {};
+	struct MultiLine : Multi {};
+	struct GeometryCollection : Multi {};
+};
+
+template<class IMPL>
+class WKBVisitor {
+private:
+	template<class VERTEX_TYPE = VertexXY, bool IS_BIG_ENDIAN>
+	void VisitWKBInternal(BinaryReader &reader, GeometryType type) {
+		switch (type) {
+			case GeometryType::POINT: {
+
+				constexpr auto nan = std::numeric_limits<double>::quiet_NaN();
+				constexpr double nan_array[] = {nan, nan, nan, nan};
+
+				auto reader_copy = reader;
+
+				const auto vertex_array = reader.Reserve(sizeof(VERTEX_TYPE));
+				const auto vertex_count = memcmp(vertex_array, &nan_array, sizeof(VERTEX_TYPE)) == 0 ? 0 : 1;
+
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::Point{}, vertex_count);
+				static_cast<IMPL*>(this)->template Vertices<VERTEX_TYPE, IS_BIG_ENDIAN>(reader_copy, vertex_count);
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::Point{}, vertex_count);
+
+				break;
+			} break;
+			case GeometryType::LINESTRING: {
+				const auto vertex_count = reader.Read<uint32_t, IS_BIG_ENDIAN>();
+				auto reader_copy = reader;
+				reader.Skip(vertex_count * sizeof(VERTEX_TYPE));
+
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::Line{}, vertex_count);
+				static_cast<IMPL*>(this)->template Vertices<VERTEX_TYPE, IS_BIG_ENDIAN>(reader_copy, vertex_count);
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::Line{}, vertex_count);
+
+			} break;
+			case GeometryType::POLYGON: {
+				const auto ring_count = reader.Read<uint32_t, IS_BIG_ENDIAN>();
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::Polygon{}, ring_count);
+
+				for (uint32_t i = 0; i < ring_count; i++) {
+					const auto vertex_count = reader.Read<uint32_t, IS_BIG_ENDIAN>();
+					static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::Ring{}, vertex_count);
+					auto reader_copy = reader;
+					reader.Skip(vertex_count * sizeof(VERTEX_TYPE));
+					static_cast<IMPL*>(this)->template Vertices<VERTEX_TYPE, IS_BIG_ENDIAN>(reader_copy, vertex_count);
+
+					static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::Ring{}, vertex_count);
+				}
+
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::Polygon{}, ring_count);
+			} break;
+			case GeometryType::MULTIPOINT: {
+				auto count = reader.Read<uint32_t, IS_BIG_ENDIAN>();
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::MultiPoint{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					Visit(reader);
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::MultiPoint{}, count);
+			} break;
+			case GeometryType::MULTILINESTRING: {
+				auto count = reader.Read<uint32_t, IS_BIG_ENDIAN>();
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::MultiLine{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					Visit(reader);
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::MultiLine{}, count);
+			} break;
+			case GeometryType::MULTIPOLYGON: {
+				auto count = reader.Read<uint32_t, IS_BIG_ENDIAN>();
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::MultiPolygon{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					Visit(reader);
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::MultiPolygon{}, count);
+			} break;
+			case GeometryType::GEOMETRYCOLLECTION: {
+				auto count = reader.Read<uint32_t, IS_BIG_ENDIAN>();
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::GeometryCollection{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					Visit(reader);
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::GeometryCollection{}, count);
+			} break;
+			default:
+				throw InvalidInputException("WKBVisitor: Unsupported geometry type %d", static_cast<int>(type));
+		}
+	}
+
+	template<bool IS_BIG_ENDIAN>
+	void VisitWKB(BinaryReader &reader) {
+		const auto header = reader.Read<uint32_t, IS_BIG_ENDIAN>();
+		const auto flag = (header & 0xFFFF) / 1000;
+		const auto type = (header & 0xFFFF) % 1000;
+
+		const auto has_z = (flag & 0x01) != 0;
+		const auto has_m = (flag & 0x02) != 0;
+
+		if (has_z && has_m) {
+			VisitWKBInternal<VertexXYZM, IS_BIG_ENDIAN>(reader, static_cast<GeometryType>(type));
+		} else if (has_z) {
+			VisitWKBInternal<VertexXYZ, IS_BIG_ENDIAN>(reader, static_cast<GeometryType>(type));
+		} else if (has_m) {
+			VisitWKBInternal<VertexXYM, IS_BIG_ENDIAN>(reader, static_cast<GeometryType>(type));
+		} else {
+			VisitWKBInternal<VertexXY, IS_BIG_ENDIAN>(reader, static_cast<GeometryType>(type));
+		}
+	}
+
+	void VisitBKB(BinaryReader &reader) {
+		throw NotImplementedException("WKBVisitor: Not implemented for bkb");
+	}
+
+	void Visit(BinaryReader &reader) {
+		const auto be = reader.Read<uint8_t>();
+		switch (be) {
+		case 0x00: // Big-endian
+			VisitWKB<true>(reader);
+			break;
+		case 0x01: // Little-endian
+			VisitWKB<false>(reader);
+			break;
+		case 0x02: // BKB (Better Known Binary)
+			VisitBKB(reader);
+		default:
+			throw InvalidInputException("WKBVisitor: Unsupported byte order %02x", be);
+		}
+	}
+public:
+	void Visit(const char* data, size_t size) {
+		BinaryReader reader(data, size);
+		Visit(reader);
+	}
+};
+
+
+} // namespace
+} // namespace duckdb
+//======================================================================================================================
+// WKB Functions
+//======================================================================================================================
+namespace duckdb {
+namespace {
+
+struct WKB_FromBlob {
+
+	struct ToLittleEndianWKB : public WKBVisitor<ToLittleEndianWKB> {
+		BinaryWriter writer;
+		bool in_point = false;
+
+		template<class VERTEX_TYPE = VertexXY, bool IS_BIG_ENDIAN = false>
+		void Vertices(BinaryReader &reader, uint32_t vertex_count) {
+			if (in_point) {
+				if (vertex_count == 0) {
+					constexpr auto nan = std::numeric_limits<double>::quiet_NaN();
+					constexpr double nan_array[] = {nan, nan, nan, nan};
+					writer.Copy(reinterpret_cast<const char*>(&nan_array), sizeof(VERTEX_TYPE));
+				} else {
+					auto vertex = reader.Read<VERTEX_TYPE, IS_BIG_ENDIAN>();
+					writer.Write(vertex);
+				}
+				return;
+			}
+
+			writer.Write<uint32_t>(vertex_count);
+			writer.Reserve(vertex_count * sizeof(VERTEX_TYPE));
+			for (uint32_t i = 0; i < vertex_count; i++) {
+				auto vertex = reader.Read<VERTEX_TYPE, IS_BIG_ENDIAN>();
+				writer.Write(vertex);
+			}
+		}
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Point, uint32_t count) {
+			in_point = true;
+			writer.Write<uint8_t>(1);
+			auto flag = static_cast<uint32_t>(GeometryType::POINT);
+			if (VERTEX_TYPE::HAS_Z) { flag += 1000; }
+			if (VERTEX_TYPE::HAS_M) { flag += 2000; }
+			writer.Write<uint32_t>(flag);
+		}
+
+		template<class VERTEX_TYPE>
+		void Leave(Tags::Point) {
+			in_point = false;
+		}
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Line, uint32_t count) {
+			writer.Write<uint8_t>(1);
+			auto flag = static_cast<uint32_t>(GeometryType::LINESTRING);
+			if (VERTEX_TYPE::HAS_Z) { flag += 1000; }
+			if (VERTEX_TYPE::HAS_M) { flag += 2000; }
+			writer.Write<uint32_t>(flag);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Polygon, uint32_t count) {
+			writer.Write<uint8_t>(1);
+			auto flag = static_cast<uint32_t>(GeometryType::POLYGON);
+			if (VERTEX_TYPE::HAS_Z) { flag += 1000; }
+			if (VERTEX_TYPE::HAS_M) { flag += 2000; }
+			writer.Write<uint32_t>(flag);
+
+			writer.Write<uint32_t>(count); // Write the number of rings
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Ring, uint32_t count) { /* Do nothing */ }
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::MultiPoint, uint32_t count) {
+			writer.Write<uint8_t>(1);
+			auto flag = static_cast<uint32_t>(GeometryType::MULTIPOINT);
+			if (VERTEX_TYPE::HAS_Z) { flag += 1000; }
+			if (VERTEX_TYPE::HAS_M) { flag += 2000; }
+			writer.Write<uint32_t>(flag);
+
+			writer.Write<uint32_t>(count); // Write the number of points
+		}
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::MultiLine, uint32_t count) {
+			writer.Write<uint8_t>(1);
+			auto flag = static_cast<uint32_t>(GeometryType::MULTILINESTRING);
+			if (VERTEX_TYPE::HAS_Z) { flag += 1000; }
+			if (VERTEX_TYPE::HAS_M) { flag += 2000; }
+			writer.Write<uint32_t>(flag);
+
+			writer.Write<uint32_t>(count); // Write the number of lines
+		}
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::MultiPolygon, uint32_t count) {
+			writer.Write<uint8_t>(1);
+			auto flag = static_cast<uint32_t>(GeometryType::MULTIPOLYGON);
+			if (VERTEX_TYPE::HAS_Z) { flag += 1000; }
+			if (VERTEX_TYPE::HAS_M) { flag += 2000; }
+			writer.Write<uint32_t>(flag);
+
+			writer.Write<uint32_t>(count); // Write the number of polygons
+		}
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::GeometryCollection, uint32_t count) {
+			writer.Write<uint8_t>(1);
+			auto flag = static_cast<uint32_t>(GeometryType::GEOMETRYCOLLECTION);
+			if (VERTEX_TYPE::HAS_Z) { flag += 1000; }
+			if (VERTEX_TYPE::HAS_M) { flag += 2000; }
+			writer.Write<uint32_t>(flag);
+
+			writer.Write<uint32_t>(count); // Write the number of geometries in the collection
+		}
+
+		template<class VERTEX_TYPE>
+		void Leave(Tags::Any, uint32_t count) { /* Do nothing */ }
+	};
+
+	static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
+
+		ToLittleEndianWKB visitor;
+		UnaryExecutor::Execute<string_t, string_t>(
+		    args.data[0], result, args.size(),
+		    [&](const string_t &input) {
+		    	visitor.writer.Reset();
+		    	visitor.writer.Reserve(input.GetSize()); // Should be the same size as the input
+
+			    visitor.Visit(input.GetData(), input.GetSize());
+
+		    	return StringVector::AddStringOrBlob(result, visitor.writer.GetData(), visitor.writer.GetSize());
+		    });
+
+	}
+
+	static void ExecuteReinterpret(DataChunk &args, ExpressionState &state, Vector &result) {
+		result.Reinterpret(args.data[0]);
+	}
+
+	static void Register(DatabaseInstance &db) {
+		ScalarFunction reinterpret_func(
+		    "wkb_reinterpret_blob", {LogicalType::BLOB}, Types::WKB(), ExecuteReinterpret);
+		ExtensionUtil::RegisterFunction(db, std::move(reinterpret_func));
+
+		ScalarFunction func("wkb_from_blob", {LogicalType::BLOB}, Types::WKB(), Execute);
+		ExtensionUtil::RegisterFunction(db, std::move(func));
+	}
+};
+
+struct WKB_Extent {
+
+	struct ExtentVisitor : public WKBVisitor<ExtentVisitor> {
+		double min_x = std::numeric_limits<double>::max();
+		double min_y = std::numeric_limits<double>::max();
+		double max_x = std::numeric_limits<double>::lowest();
+		double max_y = std::numeric_limits<double>::lowest();
+		uint32_t total_vertices = 0;
+
+		template<class VERTEX_TYPE = VertexXY, bool IS_BIG_ENDIAN = false>
+		void Vertices(BinaryReader &reader, uint32_t vertex_count) {
+			total_vertices += vertex_count;
+
+			for (uint32_t i = 0; i < vertex_count; i++) {
+				auto vertex = reader.Read<VERTEX_TYPE, IS_BIG_ENDIAN>();
+				min_x = std::min(min_x, vertex.x);
+				min_y = std::min(min_y, vertex.y);
+				max_x = std::max(max_x, vertex.x);
+				max_y = std::max(max_y, vertex.y);
+			}
+		}
+
+		template<class V> void Enter(Tags::Any, uint32_t) {} // Do nothing for generic entry
+		template<class V> void Leave(Tags::Any, uint32_t) {} // Do nothing for generic leave
+	};
+
+	static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
+		const auto &bbox_vec = StructVector::GetEntries(result);
+		const auto min_x_data = FlatVector::GetData<double>(*bbox_vec[0]);
+		const auto min_y_data = FlatVector::GetData<double>(*bbox_vec[1]);
+		const auto max_x_data = FlatVector::GetData<double>(*bbox_vec[2]);
+		const auto max_y_data = FlatVector::GetData<double>(*bbox_vec[3]);
+
+		UnifiedVectorFormat input_vdata;
+		args.data[0].ToUnifiedFormat(args.size(), input_vdata);
+		const auto input_data = UnifiedVectorFormat::GetData<string_t>(input_vdata);
+
+		const auto count = args.size();
+
+		for (idx_t out_idx = 0; out_idx < count; out_idx++) {
+			const auto row_idx = input_vdata.sel->get_index(out_idx);
+			if (!input_vdata.validity.RowIsValid(row_idx)) {
+				// null in -> null out
+				FlatVector::SetNull(result, out_idx, true);
+				continue;
+			}
+
+			const auto &blob = input_data[row_idx];
+
+			ExtentVisitor visitor;
+			visitor.Visit(blob.GetData(), blob.GetSize());
+			if (visitor.total_vertices == 0) {
+				FlatVector::SetNull(result, out_idx, true);
+				continue;
+			}
+
+			min_x_data[out_idx] = visitor.min_x;
+			min_y_data[out_idx] = visitor.min_y;
+			max_x_data[out_idx] = visitor.max_x;
+			max_y_data[out_idx] = visitor.max_y;
+		}
+	}
+
+	static void Register(DatabaseInstance &db) {
+		const auto box_type = LogicalType::STRUCT({{"min_x", LogicalType::DOUBLE},
+																{"min_y", LogicalType::DOUBLE},
+																{"max_x", LogicalType::DOUBLE},
+																{"max_y", LogicalType::DOUBLE}});
+		ScalarFunctionSet set("st_extent");
+		set.AddFunction(ScalarFunction({Types::WKB()}, box_type, Execute));
+		set.AddFunction(ScalarFunction({Types::BKB()}, box_type, Execute));
+		ExtensionUtil::RegisterFunction(db, std::move(set));
+
+
+	}
+};
+
+} // namespace
+} // namespace duckdb
+//======================================================================================================================
+// Extension Loading
+//======================================================================================================================
+namespace duckdb {
+
+static void LoadInternal(DatabaseInstance &instance) {
+	Types::Register(instance);
+	WKB_FromBlob::Register(instance);
+	WKB_Extent::Register(instance);
+	// Register a scalar function
+}
+
+void GeobenchExtension::Load(DuckDB &db) {
+	LoadInternal(*db.instance);
+}
+std::string GeobenchExtension::Name() {
+	return "geobench";
+}
+
+std::string GeobenchExtension::Version() const {
+#ifdef EXT_VERSION_GEOBENCH
+	return EXT_VERSION_GEOBENCH;
+#else
+	return "";
+#endif
+}
+
+} // namespace duckdb
+
+extern "C" {
+
+DUCKDB_EXTENSION_API void geobench_init(duckdb::DatabaseInstance &db) {
+	duckdb::DuckDB db_wrapper(db);
+	db_wrapper.LoadExtension<duckdb::GeobenchExtension>();
+}
+
+DUCKDB_EXTENSION_API const char *geobench_version() {
+	return duckdb::DuckDB::LibraryVersion();
+}
+}
+
+#ifndef DUCKDB_EXTENSION_MAIN
+#error DUCKDB_EXTENSION_MAIN not defined
+#endif
