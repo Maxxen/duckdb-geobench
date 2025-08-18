@@ -19,6 +19,17 @@ public:
 	BinaryReader(const char* data, size_t size)
 	    : beg(data), ptr(data), end(data + size) {}
 
+	void Rollback(size_t size) {
+		if (ptr - size < beg) {
+			throw InvalidInputException("BinaryReader: Attempt to rollback past beginning of buffer");
+		}
+		ptr -= size;
+	}
+
+	bool IsAligned(size_t alignment = alignof(double)) const {
+		return (reinterpret_cast<uintptr_t>(ptr) % alignment) == 0;
+	}
+
 	const char* Reserve(size_t size) {
 		if (ptr + size > end) {
 			throw InvalidInputException("BinaryReader: Attempt to reserve past end of buffer");
@@ -215,6 +226,28 @@ struct Tags {
 	struct GeometryCollection : Multi {};
 };
 
+struct BKBMeta {
+	uint8_t meta[4];
+	uint32_t size;
+
+	void Verify() const {
+		if (meta[0] != 0x02 || meta[1] != 0x01) {
+			throw InvalidInputException("BKBMeta: Invalid BKB header");
+		}
+	}
+
+	GeometryType GetType() const {
+		return static_cast<GeometryType>(meta[3]);
+	}
+	bool HasZ() const {
+		return (meta[2] & 0x01) != 0;
+	}
+	bool HasM() const {
+		return (meta[2] & 0x02) != 0;
+	}
+	uint32_t GetCount() const { return size; }
+};
+
 template<class IMPL>
 class WKBVisitor {
 private:
@@ -320,8 +353,87 @@ private:
 		}
 	}
 
+
+	template<class VERTEX_TYPE>
+	void VisitBKBInternal(BinaryReader &reader, const BKBMeta &meta) {
+
+		const auto count = meta.GetCount();
+
+		switch (meta.GetType()) {
+			case GeometryType::POINT: {
+				auto reader_copy = reader;
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::Point{}, count);
+				static_cast<IMPL*>(this)->template Vertices<VERTEX_TYPE, false>(reader_copy, count);
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::Point{}, count);
+				reader.Skip(count * sizeof(VERTEX_TYPE));
+			} break;
+			case GeometryType::LINESTRING: {
+				auto reader_copy = reader;
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::Line{}, count);
+				static_cast<IMPL*>(this)->template Vertices<VERTEX_TYPE, false>(reader_copy, count);
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::Line{}, count);
+				reader.Skip(count * sizeof(VERTEX_TYPE));
+			} break;
+			case GeometryType::POLYGON: {
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::Polygon{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					auto ring_meta = reader.Read<BKBMeta>();
+					ring_meta.Verify();
+
+					auto reader_copy = reader;
+					static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::Ring{}, ring_meta.GetCount());
+					static_cast<IMPL*>(this)->template Vertices<VERTEX_TYPE, false>(reader_copy, ring_meta.GetCount());
+					static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::Ring{}, ring_meta.GetCount());
+					reader.Skip(ring_meta.GetCount() * sizeof(VERTEX_TYPE));
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::Polygon{}, count);
+			} break;
+			case GeometryType::MULTIPOINT: {
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::MultiPoint{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					VisitBKB(reader);
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::MultiPoint{}, count);
+			} break;
+			case GeometryType::MULTILINESTRING: {
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::MultiLine{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					VisitBKB(reader);
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::MultiLine{}, count);
+			} break;
+			case GeometryType::MULTIPOLYGON: {
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::MultiPolygon{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					VisitBKB(reader);
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::MultiPolygon{}, count);
+			} break;
+			case GeometryType::GEOMETRYCOLLECTION: {
+				static_cast<IMPL*>(this)->template Enter<VERTEX_TYPE>(Tags::GeometryCollection{}, count);
+				for (uint32_t i = 0; i < count; i++) {
+					VisitBKB(reader);
+				}
+				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::GeometryCollection{}, count);
+			} break;
+			default:
+				throw InvalidInputException("WKBVisitor: Unsupported geometry type %d", static_cast<int>(meta.GetType()));
+		}
+	}
+
 	void VisitBKB(BinaryReader &reader) {
-		throw NotImplementedException("WKBVisitor: Not implemented for bkb");
+		const auto meta = reader.Read<BKBMeta>();
+		meta.Verify();
+
+		if (meta.HasZ() && meta.HasM()) {
+			VisitBKBInternal<VertexXYZM>(reader, meta);
+		} else if (meta.HasZ()) {
+			VisitBKBInternal<VertexXYZ>(reader, meta);
+		} else if (meta.HasM()) {
+			VisitBKBInternal<VertexXYM>(reader, meta);
+		} else {
+			VisitBKBInternal<VertexXY>(reader, meta);
+		}
 	}
 
 	void Visit(BinaryReader &reader) {
@@ -334,7 +446,9 @@ private:
 			VisitWKB<false>(reader);
 			break;
 		case 0x02: // BKB (Better Known Binary)
+			reader.Rollback(sizeof(uint8_t));
 			VisitBKB(reader);
+			break;
 		default:
 			throw InvalidInputException("WKBVisitor: Unsupported byte order %02x", be);
 		}
@@ -497,6 +611,92 @@ struct WKB_FromBlob {
 	}
 };
 
+struct BKB_FromBlob {
+
+	struct ToBKBVisitor : public WKBVisitor<ToBKBVisitor> {
+		BinaryWriter writer;
+
+		template<class VERTEX_TYPE = VertexXY, bool IS_BIG_ENDIAN>
+		void Vertices(BinaryReader &reader, uint32_t vertex_count) {
+			// Copy vertices straight up
+			if (!IS_BIG_ENDIAN) {
+				const auto size = vertex_count * sizeof(VERTEX_TYPE);
+				const auto data = reader.Reserve(size);
+				writer.Copy(data, size);
+			}
+			else {
+				for (uint32_t i = 0; i < vertex_count; i++) {
+					auto vertex = reader.Read<VERTEX_TYPE, IS_BIG_ENDIAN>();
+					writer.Write(vertex);
+				}
+			}
+		}
+
+		void WriteMeta(GeometryType type, bool has_z, bool has_m, uint32_t count) {
+			BKBMeta meta;
+			meta.meta[0] = 0x02; // BKB header
+			meta.meta[1] = 0x01; // Version
+			meta.meta[2] = (has_z ? 0x01 : 0x00) | (has_m ? 0x02 : 0x00); // Z and M flags
+			meta.meta[3] = static_cast<uint8_t>(type); // Geometry type
+			meta.size = count; // Vertex count
+			writer.Write<BKBMeta>(meta);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Point, uint32_t count) {
+			WriteMeta(GeometryType::POINT, VERTEX_TYPE::HAS_Z, VERTEX_TYPE::HAS_M, count);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Line, uint32_t count) {
+			WriteMeta(GeometryType::LINESTRING, VERTEX_TYPE::HAS_Z, VERTEX_TYPE::HAS_M, count);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Polygon, uint32_t count) {
+			WriteMeta(GeometryType::POLYGON, VERTEX_TYPE::HAS_Z, VERTEX_TYPE::HAS_M, count);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Ring, uint32_t count) {
+			// Write rings as linestrings
+			WriteMeta(GeometryType::LINESTRING, VERTEX_TYPE::HAS_Z, VERTEX_TYPE::HAS_M, count);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::MultiPoint, uint32_t count) {
+			WriteMeta(GeometryType::MULTIPOINT, VERTEX_TYPE::HAS_Z, VERTEX_TYPE::HAS_M, count);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::MultiLine, uint32_t count) {
+			WriteMeta(GeometryType::MULTILINESTRING, VERTEX_TYPE::HAS_Z, VERTEX_TYPE::HAS_M, count);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::MultiPolygon, uint32_t count) {
+			WriteMeta(GeometryType::MULTIPOLYGON, VERTEX_TYPE::HAS_Z, VERTEX_TYPE::HAS_M, count);
+		}
+		template<class VERTEX_TYPE>
+		void Enter(Tags::GeometryCollection, uint32_t count) {
+			WriteMeta(GeometryType::GEOMETRYCOLLECTION, VERTEX_TYPE::HAS_Z, VERTEX_TYPE::HAS_M, count);
+		}
+
+		// Leave methods do nothing for BKB
+		template<class VERTEX_TYPE>
+		void Leave(Tags::Any, uint32_t) {}
+	};
+
+	static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
+		ToBKBVisitor visitor;
+		UnaryExecutor::Execute<string_t, string_t>(
+			args.data[0], result, args.size(),
+			[&](const string_t &input) {
+				visitor.writer.Reset();
+				visitor.Visit(input.GetData(), input.GetSize());
+				return StringVector::AddStringOrBlob(result, visitor.writer.GetData(), visitor.writer.GetSize());
+			});
+	}
+
+	static void Register(DatabaseInstance &db) {
+		ScalarFunction func("bkb_from_blob", {LogicalType::BLOB}, Types::BKB(), Execute);
+		ExtensionUtil::RegisterFunction(db, std::move(func));
+	}
+};
+
 struct WKB_Extent {
 
 	struct ExtentVisitor : public WKBVisitor<ExtentVisitor> {
@@ -510,12 +710,23 @@ struct WKB_Extent {
 		void Vertices(BinaryReader &reader, uint32_t vertex_count) {
 			total_vertices += vertex_count;
 
-			for (uint32_t i = 0; i < vertex_count; i++) {
-				auto vertex = reader.Read<VERTEX_TYPE, IS_BIG_ENDIAN>();
-				min_x = std::min(min_x, vertex.x);
-				min_y = std::min(min_y, vertex.y);
-				max_x = std::max(max_x, vertex.x);
-				max_y = std::max(max_y, vertex.y);
+			if (reader.IsAligned()) { // This line is absolutely critical, gives about 30% performance boost!!!!
+				auto ptr = reinterpret_cast<const VERTEX_TYPE*>(reader.Reserve(vertex_count * sizeof(VERTEX_TYPE)));
+				for (uint32_t i = 0; i < vertex_count; i++) {
+					auto vertex = ptr[i];
+					min_x = std::min(min_x, vertex.x);
+					min_y = std::min(min_y, vertex.y);
+					max_x = std::max(max_x, vertex.x);
+					max_y = std::max(max_y, vertex.y);
+				}
+			} else {
+				for (uint32_t i = 0; i < vertex_count; i++) {
+					auto vertex = reader.Read<VERTEX_TYPE, IS_BIG_ENDIAN>();
+					min_x = std::min(min_x, vertex.x);
+					min_y = std::min(min_y, vertex.y);
+					max_x = std::max(max_x, vertex.x);
+					max_y = std::max(max_y, vertex.y);
+				}
 			}
 		}
 
@@ -584,6 +795,7 @@ namespace duckdb {
 static void LoadInternal(DatabaseInstance &instance) {
 	Types::Register(instance);
 	WKB_FromBlob::Register(instance);
+	BKB_FromBlob::Register(instance);
 	WKB_Extent::Register(instance);
 	// Register a scalar function
 }
