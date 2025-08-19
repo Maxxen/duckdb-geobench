@@ -9,7 +9,7 @@
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 
 //======================================================================================================================
-// Util
+// Common
 //======================================================================================================================
 namespace duckdb {
 namespace {
@@ -73,6 +73,10 @@ public:
 	template<class T>
 	T Read(bool is_big_endian) {
 		return is_big_endian ? Read<T, true>() : Read<T, false>();
+	}
+
+	bool IsAtEnd() const {
+		return ptr >= end;
 	}
 
 private:
@@ -169,6 +173,28 @@ struct VertexXYZM {
 	double m;
 };
 
+struct BKBMeta {
+	uint8_t meta[4];
+	uint32_t size;
+
+	void Verify() const {
+		if (meta[0] != 0x02 || meta[1] != 0x01) {
+			throw InvalidInputException("BKBMeta: Invalid BKB header");
+		}
+	}
+
+	GeometryType GetType() const {
+		return static_cast<GeometryType>(meta[3]);
+	}
+	bool HasZ() const {
+		return (meta[2] & 0x01) != 0;
+	}
+	bool HasM() const {
+		return (meta[2] & 0x02) != 0;
+	}
+	uint32_t GetCount() const { return size; }
+};
+
 } // namespace
 } // namespace duckdb
 //======================================================================================================================
@@ -226,30 +252,8 @@ struct Tags {
 	struct GeometryCollection : Multi {};
 };
 
-struct BKBMeta {
-	uint8_t meta[4];
-	uint32_t size;
-
-	void Verify() const {
-		if (meta[0] != 0x02 || meta[1] != 0x01) {
-			throw InvalidInputException("BKBMeta: Invalid BKB header");
-		}
-	}
-
-	GeometryType GetType() const {
-		return static_cast<GeometryType>(meta[3]);
-	}
-	bool HasZ() const {
-		return (meta[2] & 0x01) != 0;
-	}
-	bool HasM() const {
-		return (meta[2] & 0x02) != 0;
-	}
-	uint32_t GetCount() const { return size; }
-};
-
 template<class IMPL>
-class WKBVisitor {
+class GeometryVisitor {
 private:
 	template<class VERTEX_TYPE = VertexXY, bool IS_BIG_ENDIAN>
 	void VisitWKBInternal(BinaryReader &reader, GeometryType type) {
@@ -329,7 +333,7 @@ private:
 				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::GeometryCollection{}, count);
 			} break;
 			default:
-				throw InvalidInputException("WKBVisitor: Unsupported geometry type %d", static_cast<int>(type));
+				throw InvalidInputException("GeometryVisitor: Unsupported geometry type %d", static_cast<int>(type));
 		}
 	}
 
@@ -417,7 +421,7 @@ private:
 				static_cast<IMPL*>(this)->template Leave<VERTEX_TYPE>(Tags::GeometryCollection{}, count);
 			} break;
 			default:
-				throw InvalidInputException("WKBVisitor: Unsupported geometry type %d", static_cast<int>(meta.GetType()));
+				throw InvalidInputException("GeometryVisitor: Unsupported geometry type %d", static_cast<int>(meta.GetType()));
 		}
 	}
 
@@ -450,7 +454,7 @@ private:
 			VisitBKB(reader);
 			break;
 		default:
-			throw InvalidInputException("WKBVisitor: Unsupported byte order %02x", be);
+			throw InvalidInputException("GeometryVisitor: Unsupported byte order %02x", be);
 		}
 	}
 public:
@@ -464,14 +468,14 @@ public:
 } // namespace
 } // namespace duckdb
 //======================================================================================================================
-// WKB Functions
+// Scalar Functions
 //======================================================================================================================
 namespace duckdb {
 namespace {
 
 struct WKB_FromBlob {
 
-	struct ToLittleEndianWKB : public WKBVisitor<ToLittleEndianWKB> {
+	struct ToLittleEndianWKB : public GeometryVisitor<ToLittleEndianWKB> {
 		BinaryWriter writer;
 		bool in_point = false;
 
@@ -613,7 +617,7 @@ struct WKB_FromBlob {
 
 struct BKB_FromBlob {
 
-	struct ToBKBVisitor : public WKBVisitor<ToBKBVisitor> {
+	struct ToBKBVisitor : public GeometryVisitor<ToBKBVisitor> {
 		BinaryWriter writer;
 
 		template<class VERTEX_TYPE = VertexXY, bool IS_BIG_ENDIAN>
@@ -697,9 +701,10 @@ struct BKB_FromBlob {
 	}
 };
 
-struct WKB_Extent {
+struct ST_Extent {
 
-	struct ExtentVisitor : public WKBVisitor<ExtentVisitor> {
+	struct ExtentVisitor : public GeometryVisitor<ExtentVisitor> {
+
 		double min_x = std::numeric_limits<double>::max();
 		double min_y = std::numeric_limits<double>::max();
 		double max_x = std::numeric_limits<double>::lowest();
@@ -713,6 +718,7 @@ struct WKB_Extent {
 			if (reader.IsAligned()) { // This line is absolutely critical, gives about 30% performance boost!!!!
 				auto ptr = reinterpret_cast<const VERTEX_TYPE*>(reader.Reserve(vertex_count * sizeof(VERTEX_TYPE)));
 				for (uint32_t i = 0; i < vertex_count; i++) {
+					// Just dereference the pointer directly
 					auto vertex = ptr[i];
 					min_x = std::min(min_x, vertex.x);
 					min_y = std::min(min_y, vertex.y);
@@ -721,6 +727,7 @@ struct WKB_Extent {
 				}
 			} else {
 				for (uint32_t i = 0; i < vertex_count; i++) {
+					// Make a memcpy (in .Read)
 					auto vertex = reader.Read<VERTEX_TYPE, IS_BIG_ENDIAN>();
 					min_x = std::min(min_x, vertex.x);
 					min_y = std::min(min_y, vertex.y);
@@ -780,8 +787,6 @@ struct WKB_Extent {
 		set.AddFunction(ScalarFunction({Types::WKB()}, box_type, Execute));
 		set.AddFunction(ScalarFunction({Types::BKB()}, box_type, Execute));
 		ExtensionUtil::RegisterFunction(db, std::move(set));
-
-
 	}
 };
 
@@ -796,8 +801,7 @@ static void LoadInternal(DatabaseInstance &instance) {
 	Types::Register(instance);
 	WKB_FromBlob::Register(instance);
 	BKB_FromBlob::Register(instance);
-	WKB_Extent::Register(instance);
-	// Register a scalar function
+	ST_Extent::Register(instance);
 }
 
 void GeobenchExtension::Load(DuckDB &db) {
