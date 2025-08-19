@@ -782,7 +782,7 @@ struct ST_Extent {
 		}
 	}
 
-	static void ExecuteNonRecursive(DataChunk &args, ExpressionState &state, Vector &result) {
+	static void ExecuteBKBNonRecursive(DataChunk &args, ExpressionState &state, Vector &result) {
 		const auto &bbox_vec = StructVector::GetEntries(result);
 		const auto min_x_data = FlatVector::GetData<double>(*bbox_vec[0]);
 		const auto min_y_data = FlatVector::GetData<double>(*bbox_vec[1]);
@@ -822,6 +822,8 @@ struct ST_Extent {
 					case GeometryType::LINESTRING: {
 						const auto vertex_parts = static_cast<VertexType>(meta.HasZ() + meta.HasM());
 						const auto vertex_count = meta.GetCount();
+
+						total_vertices += vertex_count;
 
 						switch (vertex_parts) {
 						case VertexType::XY: {
@@ -869,12 +871,210 @@ struct ST_Extent {
 					case GeometryType::MULTILINESTRING:
 					case GeometryType::MULTIPOLYGON:
 					case GeometryType::GEOMETRYCOLLECTION:
+						continue;
+					default:
+						throw InvalidInputException("Unknown meta type");
+				}
+			}
+
+			if (total_vertices == 0) {
+				FlatVector::SetNull(result, out_idx, true);
+				continue;
+			}
+
+
+			min_x_data[out_idx] = min_x;
+			min_y_data[out_idx] = min_y;
+			max_x_data[out_idx] = max_x;
+			max_y_data[out_idx] = max_y;
+		}
+
+		if (args.AllConstant()) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		}
+	}
+
+	static void ExecuteWKBNonRecursive(DataChunk &args, ExpressionState &state, Vector &result) {
+		const auto &bbox_vec = StructVector::GetEntries(result);
+		const auto min_x_data = FlatVector::GetData<double>(*bbox_vec[0]);
+		const auto min_y_data = FlatVector::GetData<double>(*bbox_vec[1]);
+		const auto max_x_data = FlatVector::GetData<double>(*bbox_vec[2]);
+		const auto max_y_data = FlatVector::GetData<double>(*bbox_vec[3]);
+
+		UnifiedVectorFormat input_vdata;
+		args.data[0].ToUnifiedFormat(args.size(), input_vdata);
+		const auto input_data = UnifiedVectorFormat::GetData<string_t>(input_vdata);
+
+		const auto count = args.size();
+
+		for (idx_t out_idx = 0; out_idx < count; out_idx++) {
+			const auto row_idx = input_vdata.sel->get_index(out_idx);
+			if (!input_vdata.validity.RowIsValid(row_idx)) {
+				// null in -> null out
+				FlatVector::SetNull(result, out_idx, true);
+				continue;
+			}
+
+			const auto &blob = input_data[row_idx];
+			const auto blob_ptr = blob.GetData();
+			const auto blob_len = blob.GetSize();
+
+			auto min_x = std::numeric_limits<double>::max();
+			auto min_y = std::numeric_limits<double>::max();
+			auto max_x = std::numeric_limits<double>::lowest();
+			auto max_y = std::numeric_limits<double>::lowest();
+			uint32_t total_vertices = 0;
+
+			BinaryReader reader(blob_ptr, blob_len);
+			while (!reader.IsAtEnd()) {
+
+				const auto le = reader.Read<uint8_t>();
+				if (le != 0x01) {
+					throw InvalidInputException("GeometryVisitor: Expected little-endian byte order, got %02x", le);
+				}
+				const auto type_id = reader.Read<uint32_t>();
+				const auto type = static_cast<GeometryType>(type_id % 1000);
+				const auto flag = type_id / 1000;
+				const auto has_z = (flag & 0x01) != 0;
+				const auto has_m = (flag & 0x02) != 0;
+
+				switch (type) {
+					case GeometryType::POINT: {
+						const auto x = reader.Read<double>();
+						const auto y = reader.Read<double>();
+
+						if (std::isnan(x) && std::isnan(y)) {
+							// Skip NaN points
+							continue;
+						}
+
+						min_x = std::min(min_x, x);
+						min_y = std::min(min_y, y);
+						max_x = std::max(max_x, x);
+						max_y = std::max(max_y, y);
+
+						total_vertices += 1;
+
+						if (has_z) {
+							reader.Read<double>(); // Skip Z
+						}
+						if (has_m) {
+							reader.Read<double>(); // Skip M
+						}
+					} break;
+					case GeometryType::LINESTRING: {
+						const auto vertex_parts = static_cast<VertexType>(has_z + has_m);
+						const auto vertex_count = reader.Read<uint32_t>();
+
+						total_vertices += vertex_count;
+
+						switch (vertex_parts) {
+						case VertexType::XY: {
+							for (uint32_t i = 0; i < vertex_count; i++) {
+								const auto v = reader.Read<VertexXY>();
+								min_x = std::min(min_x, v.x);
+								min_y = std::min(min_y, v.y);
+								max_x = std::max(max_x, v.x);
+								max_y = std::max(max_y, v.y);
+							}
+						} break;
+						case VertexType::XYM: {
+							for (uint32_t i = 0; i < vertex_count; i++) {
+								const auto v = reader.Read<VertexXYM>();
+								min_x = std::min(min_x, v.x);
+								min_y = std::min(min_y, v.y);
+								max_x = std::max(max_x, v.x);
+								max_y = std::max(max_y, v.y);
+							}
+						} break;
+						case VertexType::XYZ: {
+							for (uint32_t i = 0; i < vertex_count; i++) {
+								const auto v = reader.Read<VertexXYZ>();
+								min_x = std::min(min_x, v.x);
+								min_y = std::min(min_y, v.y);
+								max_x = std::max(max_x, v.x);
+								max_y = std::max(max_y, v.y);
+							}
+						} break;
+						case VertexType::XYZM: {
+							for (uint32_t i = 0; i < vertex_count; i++) {
+								const auto v = reader.Read<VertexXYZM>();
+								min_x = std::min(min_x, v.x);
+								min_y = std::min(min_y, v.y);
+								max_x = std::max(max_x, v.x);
+								max_y = std::max(max_y, v.y);
+							}
+						} break;
+						default:
+							throw InvalidInputException("Unknown vertex type");
+						}
+					} break;
+					case GeometryType::POLYGON: {
+						const auto vertex_parts = static_cast<VertexType>(has_z + has_m);
+						const auto ring_count = reader.Read<uint32_t>();
+
+						for (uint32_t r = 0; r < ring_count; r++) {
+							const auto vertex_count = reader.Read<uint32_t>();
+							total_vertices += vertex_count;
+
+							switch (vertex_parts) {
+							case VertexType::XY: {
+								for (uint32_t i = 0; i < vertex_count; i++) {
+									const auto v = reader.Read<VertexXY>();
+									min_x = std::min(min_x, v.x);
+									min_y = std::min(min_y, v.y);
+									max_x = std::max(max_x, v.x);
+									max_y = std::max(max_y, v.y);
+								}
+							} break;
+							case VertexType::XYM: {
+								for (uint32_t i = 0; i < vertex_count; i++) {
+									const auto v = reader.Read<VertexXYM>();
+									min_x = std::min(min_x, v.x);
+									min_y = std::min(min_y, v.y);
+									max_x = std::max(max_x, v.x);
+									max_y = std::max(max_y, v.y);
+								}
+							} break;
+							case VertexType::XYZ: {
+								for (uint32_t i = 0; i < vertex_count; i++) {
+									const auto v = reader.Read<VertexXYZ>();
+									min_x = std::min(min_x, v.x);
+									min_y = std::min(min_y, v.y);
+									max_x = std::max(max_x, v.x);
+									max_y = std::max(max_y, v.y);
+								}
+							} break;
+							case VertexType::XYZM: {
+								for (uint32_t i = 0; i < vertex_count; i++) {
+									const auto v = reader.Read<VertexXYZM>();
+									min_x = std::min(min_x, v.x);
+									min_y = std::min(min_y, v.y);
+									max_x = std::max(max_x, v.x);
+									max_y = std::max(max_y, v.y);
+								}
+							} break;
+							default:
+								throw InvalidInputException("Unknown vertex type");
+							}
+						}
+					} break;
+					case GeometryType::MULTIPOINT:
+					case GeometryType::MULTILINESTRING:
+					case GeometryType::MULTIPOLYGON:
+					case GeometryType::GEOMETRYCOLLECTION:
+						reader.Read<uint32_t>(); // Read the count, but ignore the geometries
 						continue;;
 					default:
 						throw InvalidInputException("Unknown meta type");
 				}
 			}
 
+
+			if (total_vertices == 0) {
+				FlatVector::SetNull(result, out_idx, true);
+				continue;
+			}
 
 			min_x_data[out_idx] = min_x;
 			min_y_data[out_idx] = min_y;
@@ -897,9 +1097,10 @@ struct ST_Extent {
 		set.AddFunction(ScalarFunction({Types::BKB()}, box_type, Execute));
 		ExtensionUtil::RegisterFunction(db, std::move(set));
 
-		ScalarFunction fast_func(
-		    "st_extent_non_recursive", {Types::BKB()}, box_type, ExecuteNonRecursive);
-		ExtensionUtil::RegisterFunction(db, std::move(fast_func));
+		ScalarFunctionSet fast_set("st_extent_non_recursive");
+		fast_set.AddFunction(ScalarFunction({Types::WKB()}, box_type, ExecuteWKBNonRecursive));
+		fast_set.AddFunction(ScalarFunction({Types::BKB()}, box_type, ExecuteBKBNonRecursive));
+		ExtensionUtil::RegisterFunction(db, std::move(fast_set));
 	}
 };
 
