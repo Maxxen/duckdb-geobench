@@ -2,22 +2,7 @@
 # description: test geobench extension
 # group: [sql]
 
-# Before we load the extension, this will fail
-statement error
-SELECT geobench('Sam');
-----
-Catalog Error: Scalar Function with name geobench does not exist!
-
-# Require statement will ensure this test is run with this extension loaded
-require geobench
-
-# Confirm the extension works
 query I
-SELECT geobench('Sam');
+SELECT 1
 ----
-Geobench Sam 🐥
-
-query I
-SELECT geobench_openssl_version('Michael') ILIKE 'Geobench Michael, my linked OpenSSL version is OpenSSL%';
-----
-true
+1

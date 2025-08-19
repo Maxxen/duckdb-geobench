@@ -715,7 +715,7 @@ struct ST_Extent {
 		void Vertices(BinaryReader &reader, uint32_t vertex_count) {
 			total_vertices += vertex_count;
 
-			if (reader.IsAligned()) { // This line is absolutely critical, gives about 30% performance boost!!!!
+			if (reader.IsAligned(alignof(VERTEX_TYPE))) { // This line is absolutely critical, gives about 30% performance boost!!!!
 				auto ptr = reinterpret_cast<const VERTEX_TYPE*>(reader.Reserve(vertex_count * sizeof(VERTEX_TYPE)));
 				for (uint32_t i = 0; i < vertex_count; i++) {
 					// Just dereference the pointer directly
@@ -776,6 +776,115 @@ struct ST_Extent {
 			max_x_data[out_idx] = visitor.max_x;
 			max_y_data[out_idx] = visitor.max_y;
 		}
+
+		if (args.AllConstant()) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		}
+	}
+
+	static void ExecuteNonRecursive(DataChunk &args, ExpressionState &state, Vector &result) {
+		const auto &bbox_vec = StructVector::GetEntries(result);
+		const auto min_x_data = FlatVector::GetData<double>(*bbox_vec[0]);
+		const auto min_y_data = FlatVector::GetData<double>(*bbox_vec[1]);
+		const auto max_x_data = FlatVector::GetData<double>(*bbox_vec[2]);
+		const auto max_y_data = FlatVector::GetData<double>(*bbox_vec[3]);
+
+		UnifiedVectorFormat input_vdata;
+		args.data[0].ToUnifiedFormat(args.size(), input_vdata);
+		const auto input_data = UnifiedVectorFormat::GetData<string_t>(input_vdata);
+
+		const auto count = args.size();
+
+		for (idx_t out_idx = 0; out_idx < count; out_idx++) {
+			const auto row_idx = input_vdata.sel->get_index(out_idx);
+			if (!input_vdata.validity.RowIsValid(row_idx)) {
+				// null in -> null out
+				FlatVector::SetNull(result, out_idx, true);
+				continue;
+			}
+
+			const auto &blob = input_data[row_idx];
+			const auto blob_ptr = blob.GetData();
+			const auto blob_len = blob.GetSize();
+
+			auto min_x = std::numeric_limits<double>::max();
+			auto min_y = std::numeric_limits<double>::max();
+			auto max_x = std::numeric_limits<double>::lowest();
+			auto max_y = std::numeric_limits<double>::lowest();
+			uint32_t total_vertices = 0;
+
+			BinaryReader reader(blob_ptr, blob_len);
+			while (!reader.IsAtEnd()) {
+				const auto meta = reader.Read<BKBMeta>();
+				meta.Verify();
+				switch (meta.GetType()) {
+					case GeometryType::POINT:
+					case GeometryType::LINESTRING: {
+						const auto vertex_parts = static_cast<VertexType>(meta.HasZ() + meta.HasM());
+						const auto vertex_count = meta.GetCount();
+
+						switch (vertex_parts) {
+						case VertexType::XY: {
+							for (uint32_t i = 0; i < vertex_count; i++) {
+								const auto v = reader.Read<VertexXY>();
+								min_x = std::min(min_x, v.x);
+								min_y = std::min(min_y, v.y);
+								max_x = std::max(max_x, v.x);
+								max_y = std::max(max_y, v.y);
+							}
+						} break;
+						case VertexType::XYM: {
+							for (uint32_t i = 0; i < vertex_count; i++) {
+								const auto v = reader.Read<VertexXYM>();
+								min_x = std::min(min_x, v.x);
+								min_y = std::min(min_y, v.y);
+								max_x = std::max(max_x, v.x);
+								max_y = std::max(max_y, v.y);
+							}
+						} break;
+						case VertexType::XYZ: {
+							for (uint32_t i = 0; i < vertex_count; i++) {
+								const auto v = reader.Read<VertexXYZ>();
+								min_x = std::min(min_x, v.x);
+								min_y = std::min(min_y, v.y);
+								max_x = std::max(max_x, v.x);
+								max_y = std::max(max_y, v.y);
+							}
+						} break;
+						case VertexType::XYZM: {
+							for (uint32_t i = 0; i < vertex_count; i++) {
+								const auto v = reader.Read<VertexXYZM>();
+								min_x = std::min(min_x, v.x);
+								min_y = std::min(min_y, v.y);
+								max_x = std::max(max_x, v.x);
+								max_y = std::max(max_y, v.y);
+							}
+						} break;
+						default:
+							throw InvalidInputException("Unknown vertex type");
+						}
+					} break;
+					case GeometryType::POLYGON:
+					case GeometryType::MULTIPOINT:
+					case GeometryType::MULTILINESTRING:
+					case GeometryType::MULTIPOLYGON:
+					case GeometryType::GEOMETRYCOLLECTION:
+						continue;;
+					default:
+						throw InvalidInputException("Unknown meta type");
+				}
+			}
+
+
+			min_x_data[out_idx] = min_x;
+			min_y_data[out_idx] = min_y;
+			max_x_data[out_idx] = max_x;
+			max_y_data[out_idx] = max_y;
+		}
+
+		if (args.AllConstant()) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		}
 	}
 
 	static void Register(DatabaseInstance &db) {
@@ -787,6 +896,10 @@ struct ST_Extent {
 		set.AddFunction(ScalarFunction({Types::WKB()}, box_type, Execute));
 		set.AddFunction(ScalarFunction({Types::BKB()}, box_type, Execute));
 		ExtensionUtil::RegisterFunction(db, std::move(set));
+
+		ScalarFunction fast_func(
+		    "st_extent_non_recursive", {Types::BKB()}, box_type, ExecuteNonRecursive);
+		ExtensionUtil::RegisterFunction(db, std::move(fast_func));
 	}
 };
 
