@@ -1284,6 +1284,9 @@ struct ST_AsWKB {
 		ExtensionUtil::RegisterFunction(db, std::move(func2));
 		ScalarFunction func3("st_aswkb_cast", {Types::WKB()}, LogicalType::BLOB, Cast);
 		ExtensionUtil::RegisterFunction(db, std::move(func3));
+
+		ScalarFunction func4("wkb_to_blob", {Types::WKB()}, LogicalType::BLOB, Cast);
+		ExtensionUtil::RegisterFunction(db, std::move(func4));
 	}
 };
 

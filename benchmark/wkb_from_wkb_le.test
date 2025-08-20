@@ -1,0 +1,4 @@
+create table t1 as select wkb_to_blob(wkb_from_blob(geometry)) as geometry from 'buildings100x.parquet';
+.mode trash
+.timer on
+select count(wkb_from_blob(geometry)) as geometry from t1, range(0, 10);
