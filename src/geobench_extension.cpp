@@ -79,6 +79,10 @@ public:
 		return ptr >= end;
 	}
 
+	void Reset() {
+		ptr = beg;
+	}
+
 private:
 	const char* beg;
 	const char* ptr;
@@ -113,6 +117,35 @@ public:
 	}
 private:
 	vector<char> buffer;
+};
+
+class FixedBinaryWriter {
+public:
+	FixedBinaryWriter(char* data, size_t size)
+	    : beg(data), ptr(beg), end(beg + size) {
+	}
+
+	template<class T>
+	void Write(const T &value) {
+		if (ptr + sizeof(T) > end) {
+			throw InvalidInputException("FixedBinaryWriter: Attempt to write past end of buffer");
+		}
+		memcpy(ptr, &value, sizeof(T));
+		ptr += sizeof(T);
+	}
+
+	void Copy(const char* data, size_t size) {
+		if (ptr + size > end) {
+			throw InvalidInputException("FixedBinaryWriter: Attempt to copy past end of buffer");
+		}
+		memcpy(ptr, data, size);
+		ptr += size;
+	}
+
+private:
+	char* beg;
+	char* ptr;
+	char* end;
 };
 
 
@@ -928,11 +961,21 @@ struct ST_Extent {
 			BinaryReader reader(blob_ptr, blob_len);
 			while (!reader.IsAtEnd()) {
 
-				const auto le = reader.Read<uint8_t>();
-				if (le != 0x01) {
-					throw InvalidInputException("GeometryVisitor: Expected little-endian byte order, got %02x", le);
+				struct WKBMeta {
+					char bytes[5];
+					uint8_t LE() const { return bytes[0]; }
+					uint32_t GetType() const {
+						uint32_t type = 0;
+						memcpy(&type, bytes + 1, 4);
+						return type;
+					}
+				};
+
+				const auto meta = reader.Read<WKBMeta>();
+				if (meta.LE() != 0x01) {
+					throw InvalidInputException("GeometryVisitor: Expected little-endian byte order, got %02x", meta.LE());
 				}
-				const auto type_id = reader.Read<uint32_t>();
+				const auto type_id = meta.GetType();
 				const auto type = static_cast<GeometryType>(type_id % 1000);
 				const auto flag = type_id / 1000;
 				const auto has_z = (flag & 0x01) != 0;
@@ -1066,7 +1109,7 @@ struct ST_Extent {
 						reader.Read<uint32_t>(); // Read the count, but ignore the geometries
 						continue;;
 					default:
-						throw InvalidInputException("Unknown meta type");
+						throw InvalidInputException("Unknown meta type %d", static_cast<int>(type));
 				}
 			}
 
@@ -1104,6 +1147,151 @@ struct ST_Extent {
 	}
 };
 
+struct ST_AsWKB {
+	static uint32_t GetRequiredSize(BinaryReader &reader) {
+		uint32_t total_size = 0;
+		while (!reader.IsAtEnd()) {
+			const auto meta = reader.Read<BKBMeta>();
+			meta.Verify();
+
+			total_size += 1 + 4; // 1 byte for byte order, 4 bytes for type
+
+			switch (meta.GetType()) {
+				case GeometryType::POINT: {
+					const auto vertex_width = (2 + meta.HasZ() + meta.HasM()) * sizeof(double);
+					const auto vertex_count = meta.GetCount();
+					total_size += vertex_width;
+					reader.Skip(vertex_width * vertex_count * vertex_width); // Skip the vertex data
+				} break;
+				case GeometryType::LINESTRING: {
+					const auto vertex_width = (2 + meta.HasZ() + meta.HasM()) * sizeof(double);
+					const auto vertex_count = meta.GetCount();
+					total_size += 4 + vertex_count * vertex_width; // 4 + vertex count + vertices
+					reader.Skip(vertex_count * vertex_width); // Skip the vertex data
+				} break;
+				case GeometryType::POLYGON: {
+					total_size += 4; // 4 bytes for ring count
+					for (uint32_t ring_idx = 0; ring_idx < meta.GetCount(); ring_idx++) {
+						const auto ring_meta = reader.Read<BKBMeta>();
+						ring_meta.Verify();
+
+						const auto vertex_width = (2 + ring_meta.HasZ() + ring_meta.HasM()) * sizeof(double);
+						const auto vertex_count = ring_meta.GetCount();
+						total_size += 4 + vertex_count * vertex_width; // 4 + vertex count + vertices
+
+						reader.Skip(vertex_count * vertex_width);
+					}
+				} break;
+				case GeometryType::MULTIPOINT:
+				case GeometryType::MULTILINESTRING:
+				case GeometryType::MULTIPOLYGON:
+				case GeometryType::GEOMETRYCOLLECTION:
+					total_size += 4; // 4 bytes for count
+				break;
+				default:
+					throw InvalidInputException("Unknown meta type %d", static_cast<int>(meta.GetType()));
+			}
+		}
+		return total_size;
+	}
+
+	static void Convert(BinaryReader &reader, FixedBinaryWriter &writer) {
+		while (!reader.IsAtEnd()) {
+			const auto meta = reader.Read<BKBMeta>();
+			meta.Verify();
+
+			writer.Write<uint8_t>(0x01); // Little-endian byte order
+			writer.Write<uint32_t>(static_cast<uint32_t>(meta.GetType()) + (meta.HasZ() ? 1000 : 0) + (meta.HasM() ? 2000 : 0));
+
+			const auto count = meta.GetCount();
+			const auto width = (2 + meta.HasZ() + meta.HasM()) * sizeof(double);
+
+			switch (meta.GetType()) {
+				case GeometryType::POINT: {
+					if (count == 0) {
+						constexpr auto nan = std::numeric_limits<double>::quiet_NaN();
+						constexpr double nan_array[] = {nan, nan, nan, nan};
+						writer.Copy(reinterpret_cast<const char*>(&nan_array), width);
+					} else {
+						writer.Copy(reader.Reserve(width), width);
+					}
+				} break;
+				case GeometryType::LINESTRING: {
+					writer.Write<uint32_t>(count);
+					writer.Copy(reader.Reserve(width * count), width * count);
+				} break;
+				case GeometryType::POLYGON: {
+					// Write the number of rings
+					writer.Write<uint32_t>(count);
+					for (uint32_t ring_idx = 0; ring_idx < count; ring_idx++) {
+						auto ring_meta = reader.Read<BKBMeta>();
+						ring_meta.Verify();
+						const auto vertex_width = (2 + ring_meta.HasZ() + ring_meta.HasM()) * sizeof(double);
+						const auto vertex_count = ring_meta.GetCount();
+						writer.Write<uint32_t>(vertex_count);
+						writer.Copy(reader.Reserve(vertex_width * vertex_count), vertex_width * vertex_count);
+					}
+				} break;
+				case GeometryType::MULTIPOINT:
+				case GeometryType::MULTILINESTRING:
+				case GeometryType::MULTIPOLYGON:
+				case GeometryType::GEOMETRYCOLLECTION: {
+					// Write the number of geometries
+					writer.Write<uint32_t>(count);
+				} break;
+				default:
+					throw InvalidInputException("GeometryVisitor: Unknown meta type %d", static_cast<int>(meta.GetType()));
+
+			}
+		}
+	}
+
+	static void Copy(DataChunk &args, ExpressionState &state, Vector &result) {
+		UnaryExecutor::Execute<string_t, string_t>(
+		    args.data[0], result, args.size(),
+		    [&](const string_t &input) {
+		    	return StringVector::AddStringOrBlob(result, input.GetData(), input.GetSize());
+		    });
+	}
+
+	static void Reinterpret(DataChunk &args, ExpressionState &state, Vector &result) {
+		UnaryExecutor::Execute<string_t, string_t>(
+		    args.data[0], result, args.size(),
+		    [&](const string_t &input) {
+		    	return input;
+		    });
+		StringVector::AddHeapReference(result, args.data[0]);
+	}
+
+	static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
+		UnaryExecutor::Execute<string_t, string_t>(
+		    args.data[0], result, args.size(),
+		    [&](const string_t &input) {
+
+		    	BinaryReader reader(input.GetData(), input.GetSize());
+		    	const auto size = GetRequiredSize(reader);
+		    	auto blob = StringVector::EmptyString(result, size);
+		    	FixedBinaryWriter writer(blob.GetDataWriteable(), blob.GetSize());
+
+		    	reader.Reset();
+		    	Convert(reader, writer);
+				blob.Finalize();
+
+		    	return blob;
+		    });
+	}
+
+	static void Register(DatabaseInstance &db) {
+		ScalarFunction func("st_aswkb", {Types::BKB()}, LogicalType::BLOB, Execute);
+		ExtensionUtil::RegisterFunction(db, std::move(func));
+
+		ScalarFunction func2("st_aswkb_copy", {Types::WKB()}, LogicalType::BLOB, Copy);
+		ExtensionUtil::RegisterFunction(db, std::move(func2));
+		ScalarFunction func3("st_aswkb_cast", {Types::WKB()}, LogicalType::BLOB, Reinterpret);
+		ExtensionUtil::RegisterFunction(db, std::move(func3));
+	}
+};
+
 } // namespace
 } // namespace duckdb
 //======================================================================================================================
@@ -1116,6 +1304,7 @@ static void LoadInternal(DatabaseInstance &instance) {
 	WKB_FromBlob::Register(instance);
 	BKB_FromBlob::Register(instance);
 	ST_Extent::Register(instance);
+	ST_AsWKB::Register(instance);
 }
 
 void GeobenchExtension::Load(DuckDB &db) {
