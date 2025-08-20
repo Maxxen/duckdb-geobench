@@ -119,6 +119,7 @@ private:
 	vector<char> buffer;
 };
 
+template<bool SAFE = true>
 class FixedBinaryWriter {
 public:
 	FixedBinaryWriter(char* data, size_t size)
@@ -127,7 +128,7 @@ public:
 
 	template<class T>
 	void Write(const T &value) {
-		if (ptr + sizeof(T) > end) {
+		if (SAFE && ptr + sizeof(T) > end) {
 			throw InvalidInputException("FixedBinaryWriter: Attempt to write past end of buffer");
 		}
 		memcpy(ptr, &value, sizeof(T));
@@ -135,7 +136,7 @@ public:
 	}
 
 	void Copy(const char* data, size_t size) {
-		if (ptr + size > end) {
+		if (SAFE && ptr + size > end) {
 			throw InvalidInputException("FixedBinaryWriter: Attempt to copy past end of buffer");
 		}
 		memcpy(ptr, data, size);
@@ -1195,7 +1196,7 @@ struct ST_AsWKB {
 		return total_size;
 	}
 
-	static void Convert(BinaryReader &reader, FixedBinaryWriter &writer) {
+	static void Convert(BinaryReader &reader, FixedBinaryWriter<false> &writer) {
 		while (!reader.IsAtEnd()) {
 			const auto meta = reader.Read<BKBMeta>();
 			meta.Verify();
@@ -1254,7 +1255,7 @@ struct ST_AsWKB {
 		    	BinaryReader reader(input.GetData(), input.GetSize());
 		    	const auto size = GetRequiredSize(reader);
 		    	auto blob = StringVector::EmptyString(result, size);
-		    	FixedBinaryWriter writer(blob.GetDataWriteable(), blob.GetSize());
+		    	FixedBinaryWriter<false> writer(blob.GetDataWriteable(), blob.GetSize());
 
 		    	reader.Reset();
 		    	Convert(reader, writer);
@@ -1314,36 +1315,20 @@ struct ST_Area {
 								const auto ring_meta = reader.Read<BKBMeta>();
 								ring_meta.Verify();
 								const auto vertex_count = ring_meta.GetCount();
-								const auto vertex_width = (2 + ring_meta.HasZ() + ring_meta.HasM());
-								const auto vertex_array = reader.Reserve(vertex_count * vertex_width * sizeof(double));
+								const auto vertex_width = (2 + ring_meta.HasZ() + ring_meta.HasM()) * sizeof(double);
+								const auto vertex_array = reader.Reserve(vertex_count * vertex_width);
 
 								double sum = 0.0;
 
-								if (reader.IsAligned()) {
-									const auto ptr = reinterpret_cast<const VertexXY*>(vertex_array);
-									for (uint32_t vertex_idx = 0; vertex_idx < vertex_count; vertex_idx++) {
-										const auto v1 = ptr[vertex_idx];
-										const auto v2 = ptr[vertex_idx + 1];
-										sum += (v1.x * v2.y) - (v2.x * v1.y);
-									}
-								} else {
-									const auto x_data = vertex_array;
-									const auto y_data = x_data + sizeof(double);
-									for (uint32_t vertex_idx = 0; vertex_idx < vertex_count; vertex_idx++) {
-										const auto offset = vertex_idx * vertex_width;
-										double x0;
-										double y0;
-										double x1;
-										double y1;
+								for (uint32_t vertex_idx = 0; vertex_idx < vertex_count - 1; vertex_idx++) {
+									VertexXYZM v1;
+									VertexXYZM v2;
+									memcpy(&v1, vertex_array + vertex_idx * vertex_width, sizeof(VertexXY));
+									memcpy(&v2, vertex_array + (vertex_idx + 1) * vertex_width, sizeof(VertexXY));
 
-										memcpy(&x0, x_data + offset, sizeof(double));
-										memcpy(&y0, y_data + offset + sizeof(double), sizeof(double));
-										memcpy(&x1, x_data + offset + vertex_width, sizeof(double));
-										memcpy(&y1, y_data + offset + vertex_width + sizeof(double), sizeof(double));
-
-										sum += (x0 * y1) - (x1 * y0);
-									}
+									sum += (v1.x * v2.y) - (v2.x * v1.y);
 								}
+
 								sum = std::abs(sum) * 0.5;
 								if (ring_idx == 0) {
 									total_area += sum; // Add the area of the first ring

@@ -1,3 +1,4 @@
+create table t1 as select geometry from 'buildings100x.parquet';
 .mode trash
 .timer on
-select count(bkb_from_blob(geometry)) as geometry from 'buildings100x.parquet', range(0, 10);
+select count(bkb_from_blob(geometry)) as geometry from t1 a, range(0, 10);
