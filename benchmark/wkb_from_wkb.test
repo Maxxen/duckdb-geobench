@@ -1,0 +1,3 @@
+.mode trash
+.timer on
+select wkb_from_blob(geometry) as geometry from 'buildings.parquet', range(0, 100);

@@ -1246,23 +1246,6 @@ struct ST_AsWKB {
 		}
 	}
 
-	static void Copy(DataChunk &args, ExpressionState &state, Vector &result) {
-		UnaryExecutor::Execute<string_t, string_t>(
-		    args.data[0], result, args.size(),
-		    [&](const string_t &input) {
-		    	return StringVector::AddStringOrBlob(result, input.GetData(), input.GetSize());
-		    });
-	}
-
-	static void Reinterpret(DataChunk &args, ExpressionState &state, Vector &result) {
-		UnaryExecutor::Execute<string_t, string_t>(
-		    args.data[0], result, args.size(),
-		    [&](const string_t &input) {
-		    	return input;
-		    });
-		StringVector::AddHeapReference(result, args.data[0]);
-	}
-
 	static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
 		UnaryExecutor::Execute<string_t, string_t>(
 		    args.data[0], result, args.size(),
@@ -1281,14 +1264,108 @@ struct ST_AsWKB {
 		    });
 	}
 
+	static void Copy(DataChunk &args, ExpressionState &state, Vector &result) {
+		UnaryExecutor::Execute<string_t, string_t>(
+			args.data[0], result, args.size(),
+			[&](const string_t &input) {
+				return StringVector::AddStringOrBlob(result, input.GetData(), input.GetSize());
+			});
+	}
+
+	static void Cast(DataChunk &args, ExpressionState &state, Vector &result) {
+		result.Reinterpret(args.data[0]);
+	}
+
 	static void Register(DatabaseInstance &db) {
 		ScalarFunction func("st_aswkb", {Types::BKB()}, LogicalType::BLOB, Execute);
 		ExtensionUtil::RegisterFunction(db, std::move(func));
 
 		ScalarFunction func2("st_aswkb_copy", {Types::WKB()}, LogicalType::BLOB, Copy);
 		ExtensionUtil::RegisterFunction(db, std::move(func2));
-		ScalarFunction func3("st_aswkb_cast", {Types::WKB()}, LogicalType::BLOB, Reinterpret);
+		ScalarFunction func3("st_aswkb_cast", {Types::WKB()}, LogicalType::BLOB, Cast);
 		ExtensionUtil::RegisterFunction(db, std::move(func3));
+	}
+};
+
+struct ST_Area {
+	static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
+		UnaryExecutor::Execute<string_t, double>(args.data[0], result, args.size(),
+			[&](const string_t &input) {
+
+				double total_area = 0.0;
+				BinaryReader reader(input.GetData(), input.GetSize());
+				while (!reader.IsAtEnd()) {
+					auto meta = reader.Read<BKBMeta>();
+					meta.Verify();
+
+					switch (meta.GetType()) {
+						case GeometryType::POINT:
+						case GeometryType::LINESTRING: {
+							const auto vertex_count = meta.GetCount();
+							const auto vertex_width = (2 + meta.HasZ() + meta.HasM()) * sizeof(double);
+							reader.Skip(vertex_count * vertex_width);
+						} break;
+						case GeometryType::POLYGON: {
+							const auto ring_count = meta.GetCount();
+							for (uint32_t ring_idx = 0; ring_idx < ring_count; ring_idx++) {
+								const auto ring_meta = reader.Read<BKBMeta>();
+								ring_meta.Verify();
+								const auto vertex_count = ring_meta.GetCount();
+								const auto vertex_width = (2 + ring_meta.HasZ() + ring_meta.HasM());
+								const auto vertex_array = reader.Reserve(vertex_count * vertex_width * sizeof(double));
+
+								double sum = 0.0;
+
+								if (reader.IsAligned()) {
+									const auto ptr = reinterpret_cast<const VertexXY*>(vertex_array);
+									for (uint32_t vertex_idx = 0; vertex_idx < vertex_count; vertex_idx++) {
+										const auto v1 = ptr[vertex_idx];
+										const auto v2 = ptr[vertex_idx + 1];
+										sum += (v1.x * v2.y) - (v2.x * v1.y);
+									}
+								} else {
+									const auto x_data = vertex_array;
+									const auto y_data = x_data + sizeof(double);
+									for (uint32_t vertex_idx = 0; vertex_idx < vertex_count; vertex_idx++) {
+										const auto offset = vertex_idx * vertex_width;
+										double x0;
+										double y0;
+										double x1;
+										double y1;
+
+										memcpy(&x0, x_data + offset, sizeof(double));
+										memcpy(&y0, y_data + offset + sizeof(double), sizeof(double));
+										memcpy(&x1, x_data + offset + vertex_width, sizeof(double));
+										memcpy(&y1, y_data + offset + vertex_width + sizeof(double), sizeof(double));
+
+										sum += (x0 * y1) - (x1 * y0);
+									}
+								}
+								sum = std::abs(sum) * 0.5;
+								if (ring_idx == 0) {
+									total_area += sum; // Add the area of the first ring
+								} else {
+									total_area -= sum; // Subtract the area of subsequent rings
+								}
+							}
+						} break;
+						case GeometryType::MULTIPOINT:
+						case GeometryType::MULTILINESTRING:
+						case GeometryType::MULTIPOLYGON:
+						case GeometryType::GEOMETRYCOLLECTION:
+							break;
+						default:
+							throw InvalidInputException("GeometryVisitor: Unknown meta type %d", static_cast<int>(meta.GetType()));
+					}
+				}
+
+				return total_area;
+		});
+	}
+
+	static void Register(DatabaseInstance &db) {
+		ScalarFunction func("st_area", {Types::BKB()}, LogicalType::DOUBLE, Execute);
+		ExtensionUtil::RegisterFunction(db, std::move(func));
 	}
 };
 
@@ -1305,6 +1382,7 @@ static void LoadInternal(DatabaseInstance &instance) {
 	BKB_FromBlob::Register(instance);
 	ST_Extent::Register(instance);
 	ST_AsWKB::Register(instance);
+	ST_Area::Register(instance);
 }
 
 void GeobenchExtension::Load(DuckDB &db) {
