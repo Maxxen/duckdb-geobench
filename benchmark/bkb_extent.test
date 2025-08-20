@@ -1,4 +1,4 @@
-create table t1 as select bkb_from_blob(geometry) as geometry from 'buildings100x.parquet';
+create table t1 as select bkb_from_blob(geometry) as geometry from '${DATASET}';
 .mode trash
 .timer on
-select st_extent(a.geometry) from t1 a
+select st_extent(a.geometry) from t1 a;

@@ -1,4 +1,4 @@
-create table t1 as select geometry from 'buildings100x.parquet';
+create table t1 as select geometry from '${DATASET}';
 .mode trash
 .timer on
-select count(wkb_from_blob(geometry)) as geometry from t1, range(0, 10);
+select count(wkb_from_blob(geometry)) as geometry from t1;

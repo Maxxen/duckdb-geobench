@@ -1,4 +1,4 @@
 create table t1 as select wkb_from_blob(geometry) as geometry from '${DATASET}';
 .mode trash
 .timer on
-select count(st_aswkb_cast(a.geometry)) from t1 a;
+select count(st_area(a.geometry)) from t1 a;

@@ -1320,13 +1320,23 @@ struct ST_Area {
 
 								double sum = 0.0;
 
-								for (uint32_t vertex_idx = 0; vertex_idx < vertex_count - 1; vertex_idx++) {
-									VertexXYZM v1;
-									VertexXYZM v2;
-									memcpy(&v1, vertex_array + vertex_idx * vertex_width, sizeof(VertexXY));
-									memcpy(&v2, vertex_array + (vertex_idx + 1) * vertex_width, sizeof(VertexXY));
+								if (reader.IsAligned()) {
+									const auto vertex_ptr = reinterpret_cast<const VertexXYM*>(vertex_array);
+									for (uint32_t vertex_idx = 0; vertex_idx < vertex_count - 1; vertex_idx++) {
+										const auto &v1 = vertex_ptr[vertex_idx];
+										const auto &v2 = vertex_ptr[vertex_idx + 1];
 
-									sum += (v1.x * v2.y) - (v2.x * v1.y);
+										sum += (v1.x * v2.y) - (v2.x * v1.y);
+									}
+								} else {
+									for (uint32_t vertex_idx = 0; vertex_idx < vertex_count - 1; vertex_idx++) {
+										 VertexXYZM v1;
+										 VertexXYZM v2;
+										 memcpy(&v1, vertex_array + vertex_idx * vertex_width, sizeof(VertexXY));
+										 memcpy(&v2, vertex_array + (vertex_idx + 1) * vertex_width, sizeof(VertexXY));
+
+										 sum += (v1.x * v2.y) - (v2.x * v1.y);
+									 }
 								}
 
 								sum = std::abs(sum) * 0.5;
@@ -1351,8 +1361,79 @@ struct ST_Area {
 		});
 	}
 
+	struct AreaVisitor : GeometryVisitor<AreaVisitor> {
+		double total_area = 0.0;
+		bool in_ring = false;
+		uint32_t ring_idx = 0;
+
+		template<class VERTEX_TYPE = VertexXY, bool IS_BIG_ENDIAN = false>
+		void Vertices(BinaryReader &reader, uint32_t vertex_count) {
+			if (!in_ring) {
+				return;
+			}
+
+			if (vertex_count < 3) {
+				return; // Not enough vertices to form a polygon
+			}
+
+			const auto vertex_array = reader.Reserve(vertex_count * sizeof(VERTEX_TYPE));
+
+			double sum = 0.0;
+			for (uint32_t i = 0; i < vertex_count - 1; i++) {
+				VERTEX_TYPE v1;
+				VERTEX_TYPE v2;
+				memcpy(&v1, vertex_array + i * sizeof(VERTEX_TYPE), sizeof(VERTEX_TYPE));
+				memcpy(&v2, vertex_array + (i + 1) * sizeof(VERTEX_TYPE), sizeof(VERTEX_TYPE));
+				sum += (v1.x * v2.y) - (v2.x * v1.y);
+			}
+			if (ring_idx == 0) {
+				total_area += std::abs(sum) * 0.5; // First ring adds area
+			} else {
+				total_area -= std::abs(sum) * 0.5; // Subsequent rings subtract area
+			}
+		}
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Polygon, uint32_t count) {
+			// Points do not contribute to area
+			ring_idx = 0;
+		}
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Ring, uint32_t count) {
+			// Points do not contribute to area
+			in_ring = true;
+		}
+
+		template<class VERTEX_TYPE>
+		void Leave(Tags::Ring, uint32_t count) {
+			in_ring = false;
+			ring_idx++;
+		}
+
+		template<class VERTEX_TYPE>
+		void Enter(Tags::Any, uint32_t) { }
+
+		template<class VERTEX_TYPE>
+		void Leave(Tags::Any, uint32_t) { }
+	};
+
+	static void ExecuteVisitor(DataChunk &args, ExpressionState &state, Vector &result) {
+		UnaryExecutor::Execute<string_t, double>(args.data[0], result, args.size(),
+			[&](const string_t &input) {
+				AreaVisitor visitor;
+				visitor.Visit(input.GetData(), input.GetSize());
+				return visitor.total_area;
+			});
+	}
+
 	static void Register(DatabaseInstance &db) {
-		ScalarFunction func("st_area", {Types::BKB()}, LogicalType::DOUBLE, Execute);
+		ScalarFunctionSet set("st_area");
+		set.AddFunction(ScalarFunction({Types::BKB()}, LogicalType::DOUBLE, ExecuteVisitor));
+		set.AddFunction(ScalarFunction({Types::WKB()}, LogicalType::DOUBLE, ExecuteVisitor));
+		ExtensionUtil::RegisterFunction(db, std::move(set));
+
+		ScalarFunction func("st_area_non_recursive", {Types::BKB()}, LogicalType::DOUBLE, Execute);
 		ExtensionUtil::RegisterFunction(db, std::move(func));
 	}
 };
