@@ -2,10 +2,14 @@ import os
 import subprocess
 import re
 import argparse
+import time
 
 DUCKDB_BINARY = "build/release/duckdb"
 
 def run_benchmark(benchmark_path):
+    # Time the execution of the benchmark
+    start = time.time()
+
     # Spawn a DuckDB subprocess to run the benchmark
     try:
         result = subprocess.run(
@@ -14,15 +18,18 @@ def run_benchmark(benchmark_path):
             text=True,
             check=True
         )
+
         # Parse the timing output (Run Time (s): real 0.702 user 5.232869 sys 0.014099, using a regex
+        # There are multiple lines of output, parse them all if they start with "Run Time (s):"
         output = result.stdout
-        timing_match = re.search(r"Run Time \(s\): real ([\d.]+) user [\d.]+ sys [\d.]+", output)
-        if timing_match:
-            run_time = float(timing_match.group(1))
-            return run_time
+        matches = re.findall(r"Run Time \(s\): real ([\d.]+) user [\d.]+ sys [\d.]+", output)
+        if matches:
+            return [float(m) for m in matches]
         else:
-            print("Could not find run time in the output.")
-            exit(1)
+            print("No timing information found in output.")
+            print("Output was:")
+            print(output)
+            exit(0)
 
     except subprocess.CalledProcessError as e:
         print("Error running benchmark:")
@@ -34,22 +41,33 @@ BENCHMARKS = {
         "benchmark/bkb_area.test",
         "benchmark/bkb_area_fast.test",
         "benchmark/wkb_area.test",
+        "benchmark/wkb_area_fast.test",
     ],
     "extent": [
         "benchmark/bkb_extent.test",
         "benchmark/bkb_extent_fast.test",
+        "benchmark/wkb_extent_fast.test",
         "benchmark/wkb_extent.test",
     ],
     "to_wkb": [
         "benchmark/bkb_to_wkb.test",
+        "benchmark/bkb_to_wkb_dynamic.test",
+        "benchmark/bkb_to_wkb_visitor.test",
         "benchmark/wkb_to_wkb_cast.test",
         "benchmark/wkb_to_wkb_copy.test",
+        "benchmark/wkb_to_wkb_visitor.test",
     ],
     "from_wkb": [
         "benchmark/bkb_from_wkb.test",
         "benchmark/wkb_from_wkb.test",
         "benchmark/wkb_from_wkb_le.test",
     ],
+    "flip": [
+        "benchmark/bkb_flip.test",
+        "benchmark/wkb_flip.test",
+        "benchmark/bkb_flip_x.test",
+        "benchmark/wkb_flip_x.test",
+    ]
 }
 
 
@@ -61,13 +79,6 @@ if __name__ == "__main__":
         "-b", "--benchmark",
         choices=list(BENCHMARKS.keys()),
         help="Specify a benchmark to run. If not provided, all benchmarks will be run."
-    )
-
-    parser.add_argument(
-        "-n", "--num-runs",
-        type=int,
-        default=3,
-        help="Number of times to run each benchmark (default: 3)."
     )
 
     parser.add_argument(
@@ -99,13 +110,10 @@ if __name__ == "__main__":
 
 
             # Run each benchmark the specified number of times
-            times = []
-            for _ in range(args.num_runs):
-                run_time = run_benchmark(tmp_file)
-                times.append(run_time)
+            times = run_benchmark(tmp_file)
             # Calculate the average run time
             average_time = sum(times) / len(times)
             # Calculate standard deviation
             std_dev = (sum((x - average_time) ** 2 for x in times) / len(times)) ** 0.5
-
-            print(f" - {benchmark_path:<40}{average_time:.3f} seconds (+/- {std_dev:.3f})")
+            all_timings_str = ", ".join(f"{t:.3f}" for t in times)
+            print(f" - {benchmark_path:<40}{average_time:.3f}s avg (+/- {std_dev:.3f}), runs: [{all_timings_str}]")

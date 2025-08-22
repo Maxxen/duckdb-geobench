@@ -1,0 +1,9 @@
+create table t1 as select bkb_from_blob(geometry) as geometry from '${DATASET}';
+.mode trash
+.timer on
+WITH cte AS (select st_aswkb_dynamic(a.geometry) from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (select st_aswkb_dynamic(a.geometry) from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (select st_aswkb_dynamic(a.geometry) from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (select st_aswkb_dynamic(a.geometry) from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (select st_aswkb_dynamic(a.geometry) from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+

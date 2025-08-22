@@ -1,4 +1,4 @@
-create table t1 as select bkb_from_blob(geometry) as geometry from '${DATASET}';
+create table t1 as select wkb_from_blob(geometry) as geometry from '${DATASET}';
 .mode trash
 .timer on
 

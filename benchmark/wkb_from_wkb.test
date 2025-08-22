@@ -1,4 +1,8 @@
 create table t1 as select geometry from '${DATASET}';
 .mode trash
 .timer on
-select count(wkb_from_blob(geometry)) as geometry from t1;
+WITH cte AS (select wkb_from_blob(geometry) as geometry from t1) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (select wkb_from_blob(geometry) as geometry from t1) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (select wkb_from_blob(geometry) as geometry from t1) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (select wkb_from_blob(geometry) as geometry from t1) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (select wkb_from_blob(geometry) as geometry from t1) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
