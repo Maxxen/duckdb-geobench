@@ -106,6 +106,13 @@ public:
 	void Copy(const char* data, size_t size) {
 		buffer.insert(buffer.end(), data, data + size);
 	}
+
+	template<class T>
+	void CopyTemplated(const char* data, size_t count) {
+		// We're allocating into the vector anyway
+		Copy(data, sizeof(T) * count);
+	}
+
 	void Reset() {
 		buffer.clear();
 	}
@@ -141,6 +148,17 @@ public:
 		}
 		memcpy(ptr, data, size);
 		ptr += size;
+	}
+
+	template<class T>
+	void CopyTemplated(const char* data, size_t count) {
+		if (SAFE && ptr + sizeof(T) * count > end) {
+			throw InvalidInputException("FixedBinaryWriter: Attempt to copy past end of buffer");
+		}
+		for (size_t i = 0; i < count; i++) {
+			memcpy(ptr + sizeof(T) * i, data + sizeof(T) * i, sizeof(T));
+		}
+		ptr += sizeof(T) * count;
 	}
 
 private:
@@ -673,7 +691,7 @@ struct BKB_FromBlob {
 			if (!IS_BIG_ENDIAN) {
 				const auto size = vertex_count * sizeof(VERTEX_TYPE);
 				const auto data = reader.Reserve(size);
-				writer.Copy(data, size);
+				writer.CopyTemplated<VERTEX_TYPE>(data, vertex_count);
 			}
 			else {
 				for (uint32_t i = 0; i < vertex_count; i++) {
@@ -1344,7 +1362,7 @@ struct ST_AsWKB {
 			if (!IS_BIG_ENDIAN) {
 				const auto size = vertex_count * sizeof(VERTEX_TYPE);
 				const auto data = reader.Reserve(size);
-				writer.Copy(data, size);
+				writer.CopyTemplated<VERTEX_TYPE>(data, vertex_count);
 				return;
 			}
 			for (uint32_t i = 0; i < vertex_count; i++) {

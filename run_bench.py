@@ -93,6 +93,8 @@ if __name__ == "__main__":
     if args.benchmark:
         BENCHMARKS = {args.benchmark: BENCHMARKS[args.benchmark]}
 
+    all_results = {}
+
     for benchmark_name, benchmark_paths in BENCHMARKS.items():
         print(f"Running benchmarks for '{benchmark_name}':")
         for benchmark_path in benchmark_paths:
@@ -111,9 +113,23 @@ if __name__ == "__main__":
 
             # Run each benchmark the specified number of times
             times = run_benchmark(tmp_file)
+
+            all_results[benchmark_path] = times
+
             # Calculate the average run time
             average_time = sum(times) / len(times)
             # Calculate standard deviation
             std_dev = (sum((x - average_time) ** 2 for x in times) / len(times)) ** 0.5
             all_timings_str = ", ".join(f"{t:.3f}" for t in times)
             print(f" - {benchmark_path:<40}{average_time:.3f}s avg (+/- {std_dev:.3f}), runs: [{all_timings_str}]")
+
+
+    # Now print a markdown table with the results
+    print("\n## Benchmark Results\n")
+    print("| Benchmark | Average Time (s) | Min Time    | Max Time |")
+    print("|-----------|------------------|-------------|----------|")
+    for benchmark_path, times in all_results.items():
+        average_time = sum(times) / len(times)
+        min_time = min(times)
+        max_time = max(times)
+        print(f"| {benchmark_path:<40} | {average_time:.3f}           | {min_time:.3f}      | {max_time:.3f}   |")
