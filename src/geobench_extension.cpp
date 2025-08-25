@@ -122,6 +122,11 @@ public:
 	size_t GetSize() const {
 		return buffer.size();
 	}
+
+	size_t GetPosition() const {
+		return buffer.size();
+	}
+
 private:
 	vector<char> buffer;
 };
@@ -159,6 +164,17 @@ public:
 			memcpy(ptr + sizeof(T) * i, data + sizeof(T) * i, sizeof(T));
 		}
 		ptr += sizeof(T) * count;
+	}
+
+	size_t GetPosition() const {
+		return ptr - beg;
+	}
+
+	void Skip(size_t size) {
+		if (SAFE && ptr + size > end) {
+			throw InvalidInputException("FixedBinaryWriter: Attempt to skip past end of buffer");
+		}
+		ptr += size;
 	}
 
 private:
@@ -259,6 +275,140 @@ struct WKBMeta {
 	void SetType(uint32_t type) { memcpy(bytes + 1, &type, 4); }
 };
 
+#ifdef OKB_META_BIG
+struct OKBMeta {
+
+	GeometryType GetType() const {
+		return static_cast<GeometryType>(type);
+	}
+	bool HasZ() const {
+		return (flag & 0x01) != 0;
+	}
+	bool HasM() const {
+		return (flag & 0x02) != 0;
+	}
+	void SetType(GeometryType type_p) {
+		type = static_cast<uint32_t>(type_p);
+	}
+	void SetZ(bool has_z) {
+		if (has_z) {
+			flag |= 0x01;
+		} else {
+			flag &= ~0x01;
+		}
+	}
+	void SetM(bool has_m) {
+		if (has_m) {
+			flag |= 0x02;
+		} else {
+			flag &= ~0x02;
+		}
+	}
+
+	OKBMeta GetPart(const char* ptr, uint32_t index) const {
+		D_ASSERT(index < length);
+		OKBMeta meta;
+		memcpy(&meta, ptr + offset + (index * sizeof(OKBMeta)), sizeof(OKBMeta));
+		return meta;
+	}
+
+	VertexXY GetVertexXY(const char* ptr, uint32_t index) const {
+		D_ASSERT(!HasZ() && !HasM());
+		D_ASSERT(index < length);
+		VertexXY vertex;
+		memcpy(&vertex, ptr + offset + (index * sizeof(VertexXY)), sizeof(VertexXY));
+		return vertex;
+	}
+
+	void SetOffset(uint32_t offset_p) {
+		offset = offset_p;
+	}
+	void SetLength(uint32_t length_p) {
+		length = length_p;
+	}
+	uint32_t GetLength() const {
+		return length;
+	}
+	uint32_t GetOffset() const {
+		return offset;
+	}
+private:
+	uint32_t type = 0;
+	uint32_t flag = 0;
+	uint32_t offset = 0;
+	uint32_t length = 0;
+};
+#else
+
+struct OKBMeta {
+
+	GeometryType GetType() const {
+		return static_cast<GeometryType>(type & 0x3F);
+	}
+
+	void SetType(GeometryType type_p) {
+		type = static_cast<uint8_t>(type_p) & 0x3F;
+	}
+
+	bool HasZ() const {
+		// 1st byte is the Z flag
+		return type & (1 << 7);
+	}
+
+	bool HasM() const {
+		return type & (1 << 6);
+	}
+
+	void SetZ(bool has_z) {
+		if (has_z) {
+			type |= 0x80;
+		} else {
+			type &= ~0x80;
+		}
+	}
+	void SetM(bool has_m) {
+		if (has_m) {
+			type |= 0x40;
+		} else {
+			type &= ~0x40;
+		}
+	}
+
+	OKBMeta GetPart(const char* ptr, uint32_t index) const {
+		OKBMeta meta;
+		memcpy(&meta, ptr + offset + (index * sizeof(OKBMeta)), sizeof(OKBMeta));
+		return meta;
+	}
+
+	VertexXY GetVertexXY(const char* ptr, uint32_t index) const {
+		D_ASSERT(!HasZ() && !HasM());
+		VertexXY vertex;
+		memcpy(&vertex, ptr + offset + (index * sizeof(VertexXY)), sizeof(VertexXY));
+		return vertex;
+	}
+
+	void SetOffset(uint32_t offset_p) {
+		offset = offset_p;
+	}
+	void SetLength(uint32_t length_p) {
+		length[0] = static_cast<uint8_t>(length_p & 0xFF);
+		length[1] = static_cast<uint8_t>((length_p >> 8) & 0xFF);
+		length[2] = static_cast<uint8_t>((length_p >> 16) & 0xFF);
+	}
+	uint32_t GetLength() const {
+		return static_cast<uint32_t>(length[0]) | (static_cast<uint32_t>(length[1]) << 8) | (static_cast<uint32_t>(length[2]) << 16);
+	}
+	uint32_t GetOffset() const {
+		return offset;
+	}
+private:
+	uint8_t type = {};
+	uint8_t length[3] = {};
+	uint32_t offset = {};
+};
+
+#endif
+
 
 } // namespace
 } // namespace duckdb
@@ -281,6 +431,13 @@ struct Types {
 	static LogicalType BKB() {
 		auto ltype = LogicalType(LogicalTypeId::BLOB);
 		ltype.SetAlias("BKB");
+		return ltype;
+	}
+
+	// "Offset Known Binary" (OKB) Geometry Type
+	static LogicalType OKB() {
+		auto ltype = LogicalType(LogicalTypeId::BLOB);
+		ltype.SetAlias("OKB");
 		return ltype;
 	}
 
@@ -766,6 +923,181 @@ struct BKB_FromBlob {
 	}
 };
 
+struct OKB_FromBlob {
+
+	static void Convert(BinaryReader &reader, FixedBinaryWriter<false> &writer, FixedBinaryWriter<false> &parent_writer) {
+
+		const auto meta = reader.Read<WKBMeta>();
+		if (!meta.LE()) {
+			throw InvalidInputException("OKB_FromBlob: Only little-endian WKB is supported");
+		}
+
+		const auto type_id = meta.GetType();
+		const auto type = static_cast<GeometryType>(type_id % 1000);
+		const auto flag = type_id / 1000;
+		const auto has_z = (flag & 0x01) != 0;
+		const auto has_m = (flag & 0x02) != 0;
+
+
+		OKBMeta okb_meta;
+		okb_meta.SetType(type);
+		okb_meta.SetZ(has_z);
+		okb_meta.SetM(has_m);
+
+		const auto vertex_width = (2 + (has_z ? 1 : 0) + (has_m ? 1 : 0)) * sizeof(double);
+
+		switch (type) {
+			case GeometryType::POINT: {
+				constexpr auto nan = std::numeric_limits<double>::quiet_NaN();
+				constexpr double nan_array[] = {nan, nan, nan, nan};
+				const auto vertex_array = reader.Reserve(vertex_width);
+				const auto vertex_count = memcmp(vertex_array, &nan_array, vertex_width) == 0 ? 0 : 1;
+				okb_meta.SetOffset(writer.GetPosition());
+				okb_meta.SetLength(vertex_count);
+				if (vertex_count == 1) {
+					writer.Copy(vertex_array, vertex_width);
+				}
+			} break;
+			case GeometryType::LINESTRING: {
+				const auto count = reader.Read<uint32_t>();
+
+				okb_meta.SetOffset(writer.GetPosition());
+				okb_meta.SetLength(count);
+
+				const auto src = reader.Reserve(count * vertex_width);
+				writer.Copy(src, count * vertex_width);
+			} break;
+			case GeometryType::POLYGON: {
+				const auto ring_count = reader.Read<uint32_t>();
+				okb_meta.SetOffset(writer.GetPosition());
+				okb_meta.SetLength(ring_count);
+
+				auto ring_writer = writer; // Copy the writer
+				writer.Skip(ring_count * sizeof(OKBMeta)); // Reserve space for the ring metas
+
+				for (uint32_t i = 0; i < ring_count; i++) {
+					OKBMeta ring_meta;
+					ring_meta.SetType(GeometryType::LINESTRING);
+					ring_meta.SetZ(has_z);
+					ring_meta.SetM(has_m);
+					const auto vertex_count = reader.Read<uint32_t>();
+					ring_meta.SetOffset(writer.GetPosition());
+					ring_meta.SetLength(vertex_count);
+
+					const auto src = reader.Reserve(vertex_count * vertex_width);
+					writer.Copy(src, vertex_count * vertex_width);
+
+					ring_writer.Write<OKBMeta>(ring_meta);
+				}
+			} break;
+			case GeometryType::MULTIPOINT: break;
+			case GeometryType::MULTILINESTRING: break;
+			case GeometryType::MULTIPOLYGON: break;
+			case GeometryType::GEOMETRYCOLLECTION: {
+				const auto part_count = reader.Read<uint32_t>();
+				okb_meta.SetOffset(writer.GetPosition());
+				okb_meta.SetLength(part_count);
+
+				auto part_writer = writer; // Copy the writer
+				writer.Skip(part_count * sizeof(OKBMeta)); // Reserve space for the part metas
+				for (uint32_t i = 0; i < part_count; i++) {
+					Convert(reader, writer, part_writer);
+				}
+			} break;
+			default:
+				throw InvalidInputException("OKB_FromBlob: Unsupported geometry type %d", static_cast<int>(type));
+		}
+		parent_writer.Write<OKBMeta>(okb_meta);
+	}
+
+	static uint32_t GetRequiredSize(BinaryReader &reader) {
+		uint32_t total_size = 0;
+		while (!reader.IsAtEnd()) {
+			const auto meta = reader.Read<WKBMeta>();
+			if (!meta.LE()) {
+				throw InvalidInputException("OKB_FromBlob: Only little-endian WKB is supported");
+			}
+
+			const auto type_id = meta.GetType();
+			const auto type = static_cast<GeometryType>(type_id % 1000);
+			const auto flag = type_id / 1000;
+			const auto has_z = (flag & 0x01) != 0;
+			const auto has_m = (flag & 0x02) != 0;
+
+			const auto vertex_width = (2 + (has_z ? 1 : 0) + (has_m ? 1 : 0)) * sizeof(double);
+
+			total_size += sizeof(OKBMeta);
+
+			switch (type) {
+				case GeometryType::POINT: {
+					constexpr auto nan = std::numeric_limits<double>::quiet_NaN();
+					constexpr double nan_array[] = {nan, nan, nan, nan};
+					const auto vertex_array = reader.Reserve(vertex_width);
+					const auto vertex_count = memcmp(vertex_array, &nan_array, vertex_width) == 0 ? 0 : 1;
+					if (vertex_count == 1) {
+						total_size += vertex_width;
+					}
+				} break;
+				case GeometryType::LINESTRING: {
+					const auto count = reader.Read<uint32_t>();
+					total_size += count * vertex_width;
+					reader.Skip(count * vertex_width);
+				} break;
+				case GeometryType::POLYGON: {
+					const auto ring_count = reader.Read<uint32_t>();
+					for (uint32_t i = 0; i < ring_count; i++) {
+						const auto vertex_count = reader.Read<uint32_t>();
+
+						total_size += sizeof(OKBMeta);
+						total_size += vertex_count * vertex_width;
+
+						reader.Skip(vertex_count * vertex_width);
+					}
+				} break;
+				case GeometryType::MULTIPOINT: break;
+				case GeometryType::MULTILINESTRING: break;
+				case GeometryType::MULTIPOLYGON: break;
+				case GeometryType::GEOMETRYCOLLECTION: {
+					const auto part_count = reader.Read<uint32_t>();
+					for (uint32_t i = 0; i < part_count; i++) {
+						total_size += GetRequiredSize(reader);
+					}
+				} break;
+				default:
+					throw InvalidInputException("OKB_FromBlob Required Size: Unsupported geometry type %d", static_cast<int>(type));
+			}
+		}
+		return total_size;
+	}
+
+	static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
+		UnaryExecutor::Execute<string_t, string_t>(
+			args.data[0], result, args.size(),
+			[&](const string_t &input) {
+				BinaryReader reader(input.GetData(), input.GetSize());
+				const auto required_size = GetRequiredSize(reader);
+
+				reader.Reset();
+
+				auto blob = StringVector::EmptyString(result, required_size);
+
+				FixedBinaryWriter<false> parent_writer(blob.GetDataWriteable(), required_size);
+				auto inner_writer = parent_writer; // Copy the writer
+				inner_writer.Skip(sizeof(OKBMeta)); // Reserve space for the root meta
+
+				Convert(reader, inner_writer, parent_writer);
+
+				blob.Finalize();
+				return blob;
+			});
+	}
+
+	static void Register(DatabaseInstance &db) {
+		ScalarFunction func("okb_from_blob", {LogicalType::BLOB}, Types::OKB(), Execute);
+		ExtensionUtil::RegisterFunction(db, std::move(func));
+	}
+};
+
 struct ST_Extent {
 
 	struct ExtentVisitor : public GeometryVisitor<ExtentVisitor> {
@@ -1152,6 +1484,132 @@ struct ST_Extent {
 		}
 	}
 
+	static uint32_t TraverseOKBPointer(const char* root, const OKBMeta &okb, double &xmin, double &ymin, double &xmax, double &ymax) {
+		switch (okb.GetType()) {
+			case GeometryType::POINT:
+			case GeometryType::LINESTRING: {
+				const auto vert_count = okb.GetLength();
+				const auto vert_array = reinterpret_cast<const VertexXY*>(root + okb.GetOffset());
+				for (uint32_t i = 0; i < vert_count; i++) {
+					auto &vert = vert_array[i];
+					xmin = std::min(xmin, vert.x);
+					ymin = std::min(ymin, vert.y);
+					xmax = std::max(xmax, vert.x);
+					ymax = std::max(ymax, vert.y);
+				}
+				return vert_count;
+			} break;
+			case GeometryType::POLYGON:
+			case GeometryType::MULTIPOINT:
+			case GeometryType::MULTILINESTRING:
+			case GeometryType::MULTIPOLYGON:
+			case GeometryType::GEOMETRYCOLLECTION: {
+				// Read the parts
+				uint32_t total_vertices = 0;
+				const auto part_count = okb.GetLength();
+				const auto part_array = reinterpret_cast<const OKBMeta*>(root + okb.GetOffset());
+				for (uint32_t i = 0; i < part_count; i++) {
+					auto &part = part_array[i];
+					total_vertices += TraverseOKBPointer(root, part, xmin, ymin, xmax, ymax);
+				}
+				return total_vertices;
+			} break;
+			default:
+				throw InvalidInputException("Unknown meta type %d", static_cast<int>(okb.GetType()));
+		}
+	}
+
+	static uint32_t TraverseOKB(const char* root, OKBMeta &okb, double &xmin, double &ymin, double &xmax, double &ymax) {
+		switch (okb.GetType()) {
+			case GeometryType::POINT:
+			case GeometryType::LINESTRING: {
+				const auto vert_count = okb.GetLength();
+				for (uint32_t i = 0; i < vert_count; i++) {
+					auto vert = okb.GetVertexXY(root, i);
+					xmin = std::min(xmin, vert.x);
+					ymin = std::min(ymin, vert.y);
+					xmax = std::max(xmax, vert.x);
+					ymax = std::max(ymax, vert.y);
+				}
+				return vert_count;
+			} break;
+			case GeometryType::POLYGON:
+			case GeometryType::MULTIPOINT:
+			case GeometryType::MULTILINESTRING:
+			case GeometryType::MULTIPOLYGON:
+			case GeometryType::GEOMETRYCOLLECTION: {
+				// Read the parts
+				uint32_t total_vertices = 0;
+				const auto part_count = okb.GetLength();
+				for (uint32_t i = 0; i < part_count; i++) {
+					auto part = okb.GetPart(root, i);
+					total_vertices += TraverseOKB(root, part, xmin, ymin, xmax, ymax);
+				}
+				return total_vertices;
+			} break;
+			default:
+				throw InvalidInputException("Unknown meta type %d", static_cast<int>(okb.GetType()));
+		}
+	}
+
+	static void ExecuteOKB(DataChunk& args, ExpressionState &state, Vector& result) {
+		const auto &bbox_vec = StructVector::GetEntries(result);
+		const auto min_x_data = FlatVector::GetData<double>(*bbox_vec[0]);
+		const auto min_y_data = FlatVector::GetData<double>(*bbox_vec[1]);
+		const auto max_x_data = FlatVector::GetData<double>(*bbox_vec[2]);
+		const auto max_y_data = FlatVector::GetData<double>(*bbox_vec[3]);
+
+		UnifiedVectorFormat input_vdata;
+		args.data[0].ToUnifiedFormat(args.size(), input_vdata);
+		const auto input_data = UnifiedVectorFormat::GetData<string_t>(input_vdata);
+
+		const auto count = args.size();
+
+		for (idx_t out_idx = 0; out_idx < count; out_idx++) {
+			const auto row_idx = input_vdata.sel->get_index(out_idx);
+			if (!input_vdata.validity.RowIsValid(row_idx)) {
+				// null in -> null out
+				FlatVector::SetNull(result, out_idx, true);
+				continue;
+			}
+
+			const auto &blob = input_data[row_idx];
+			const auto blob_ptr = blob.GetData();
+			const auto blob_len = blob.GetSize();
+
+			auto min_x = std::numeric_limits<double>::max();
+			auto min_y = std::numeric_limits<double>::max();
+			auto max_x = std::numeric_limits<double>::lowest();
+			auto max_y = std::numeric_limits<double>::lowest();
+
+			// Check if pointer is aligned
+			if (reinterpret_cast<uintptr_t>(blob_ptr) % alignof(double) == 0) {
+				// Is aligned,
+				auto okb_ptr = reinterpret_cast<const OKBMeta*>(blob_ptr);
+				if (TraverseOKBPointer(blob_ptr, *okb_ptr, min_x, min_y, max_x, max_y) == 0) {
+					FlatVector::SetNull(result, out_idx, true);
+					continue;
+				}
+			} else {
+				OKBMeta part;
+				memcpy(&part, blob_ptr, sizeof(OKBMeta));
+				if (TraverseOKB(blob_ptr, part, min_x, min_y, max_x, max_y) == 0) {
+					FlatVector::SetNull(result, out_idx, true);
+					continue;
+				}
+			}
+
+			min_x_data[out_idx] = min_x;
+			min_y_data[out_idx] = min_y;
+			max_x_data[out_idx] = max_x;
+			max_y_data[out_idx] = max_y;
+		}
+
+		if (args.AllConstant()) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		}
+	}
+
 	static void Register(DatabaseInstance &db) {
 		const auto box_type = LogicalType::STRUCT({{"min_x", LogicalType::DOUBLE},
 																{"min_y", LogicalType::DOUBLE},
@@ -1165,7 +1623,9 @@ struct ST_Extent {
 		ScalarFunctionSet fast_set("st_extent_non_recursive");
 		fast_set.AddFunction(ScalarFunction({Types::WKB()}, box_type, ExecuteWKBNonRecursive));
 		fast_set.AddFunction(ScalarFunction({Types::BKB()}, box_type, ExecuteBKBNonRecursive));
+		fast_set.AddFunction(ScalarFunction({Types::OKB()}, box_type, ExecuteOKB));
 		ExtensionUtil::RegisterFunction(db, std::move(fast_set));
+
 	}
 };
 
@@ -1920,6 +2380,7 @@ namespace duckdb {
 
 static void LoadInternal(DatabaseInstance &instance) {
 	Types::Register(instance);
+	OKB_FromBlob::Register(instance);
 	WKB_FromBlob::Register(instance);
 	BKB_FromBlob::Register(instance);
 	ST_Extent::Register(instance);

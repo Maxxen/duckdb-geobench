@@ -48,6 +48,7 @@ BENCHMARKS = {
         "benchmark/bkb_extent_fast.test",
         "benchmark/wkb_extent_fast.test",
         "benchmark/wkb_extent.test",
+        "benchmark/okb_extent_fast.test",
     ],
     "to_wkb": [
         "benchmark/bkb_to_wkb.test",
