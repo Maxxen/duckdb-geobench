@@ -42,6 +42,7 @@ BENCHMARKS = {
         "benchmark/bkb_area_fast.test",
         "benchmark/wkb_area.test",
         "benchmark/wkb_area_fast.test",
+        "benchmark/okb_area_fast.test",
     ],
     "extent": [
         "benchmark/bkb_extent.test",
@@ -54,6 +55,7 @@ BENCHMARKS = {
         "benchmark/bkb_to_wkb.test",
         "benchmark/bkb_to_wkb_dynamic.test",
         "benchmark/bkb_to_wkb_visitor.test",
+        "benchmark/okb_to_wkb.test",
         "benchmark/wkb_to_wkb_cast.test",
         "benchmark/wkb_to_wkb_copy.test",
         "benchmark/wkb_to_wkb_visitor.test",
