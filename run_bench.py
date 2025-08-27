@@ -6,18 +6,36 @@ import time
 
 DUCKDB_BINARY = "build/release/duckdb"
 
-def run_benchmark(benchmark_path):
+def run_benchmark(benchmark_path, in_memory):
     # Time the execution of the benchmark
     start = time.time()
 
     # Spawn a DuckDB subprocess to run the benchmark
     try:
-        result = subprocess.run(
-            [DUCKDB_BINARY, "-f", benchmark_path],
-            capture_output=True,
-            text=True,
-            check=True
-        )
+        # Delete the temporary database file if it exists
+        if os.path.exists("tmp.db"):
+            os.remove("tmp.db")
+
+        if in_memory:
+            # Run completely in memory
+            result = subprocess.run(
+                [DUCKDB_BINARY, "-f", benchmark_path],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+        else:
+            # Run with a temporary database file
+            result = subprocess.run(
+                [DUCKDB_BINARY, "-f", benchmark_path, "tmp.db"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+        # Delete the temporary database file if it exists
+        if os.path.exists("tmp.db"):
+            os.remove("tmp.db")
 
         # Parse the timing output (Run Time (s): real 0.702 user 5.232869 sys 0.014099, using a regex
         # There are multiple lines of output, parse them all if they start with "Run Time (s):"
@@ -64,12 +82,15 @@ BENCHMARKS = {
         "benchmark/bkb_from_wkb.test",
         "benchmark/wkb_from_wkb.test",
         "benchmark/wkb_from_wkb_le.test",
+        "benchmark/okb_from_wkb.test",
     ],
     "flip": [
         "benchmark/bkb_flip.test",
         "benchmark/wkb_flip.test",
+        "benchmark/okb_flip.test",
         "benchmark/bkb_flip_x.test",
         "benchmark/wkb_flip_x.test",
+        "benchmark/okb_flip_x.test"
     ]
 }
 
@@ -89,6 +110,12 @@ if __name__ == "__main__":
         type=str,
         default="buildings.parquet",
         help="Path to the dataset file to use in benchmarks (default: 'buildings.parquet')."
+    )
+
+    parser.add_argument(
+        "-m", "--in-memory",
+        action="store_true",
+        help="Run benchmarks in memory without using a temporary database file."
     )
 
     args = parser.parse_args()
@@ -113,9 +140,8 @@ if __name__ == "__main__":
                 with open(tmp_file, 'w') as dst_file:
                     dst_file.write(bench_text)
 
-
             # Run each benchmark the specified number of times
-            times = run_benchmark(tmp_file)
+            times = run_benchmark(tmp_file, args.in_memory)
 
             all_results[benchmark_path] = times
 

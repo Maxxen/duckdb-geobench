@@ -1,0 +1,9 @@
+create table t1 as select geometry from '${DATASET}';
+.mode trash
+WITH cte AS (SELECT okb_from_blob(geometry) as geometry from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+.timer on
+WITH cte AS (SELECT okb_from_blob(geometry) as geometry from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (SELECT okb_from_blob(geometry) as geometry from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (SELECT okb_from_blob(geometry) as geometry from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (SELECT okb_from_blob(geometry) as geometry from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;
+WITH cte AS (SELECT okb_from_blob(geometry) as geometry from t1 a) SELECT ANY_VALUE(COLUMNS(*)) FROM cte;

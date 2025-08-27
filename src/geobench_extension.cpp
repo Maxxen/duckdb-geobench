@@ -1,6 +1,8 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "geobench_extension.hpp"
+#include "geobench_common.hpp"
+
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -13,233 +15,6 @@
 //======================================================================================================================
 namespace duckdb {
 namespace {
-
-class BinaryReader {
-public:
-	BinaryReader(const char* data, size_t size)
-	    : beg(data), ptr(data), end(data + size) {}
-
-	void Rollback(size_t size) {
-		if (ptr - size < beg) {
-			throw InvalidInputException("BinaryReader: Attempt to rollback past beginning of buffer");
-		}
-		ptr -= size;
-	}
-
-	bool IsAligned(size_t alignment = alignof(double)) const {
-		return (reinterpret_cast<uintptr_t>(ptr) % alignment) == 0;
-	}
-
-	const char* Reserve(size_t size) {
-		if (ptr + size > end) {
-			throw InvalidInputException("BinaryReader: Attempt to reserve past end of buffer");
-		}
-		const char* result = ptr;
-		ptr += size;
-		return result;
-	}
-
-	void Skip(size_t size) {
-		if (ptr + size > end) {
-			throw InvalidInputException("BinaryReader: Attempt to skip past end of buffer");
-		}
-		ptr += size;
-	}
-
-	template<class T, bool IS_BIG_ENDIAN = false>
-	T Read() {
-		if (ptr + sizeof(T) > end) {
-			throw InvalidInputException("BinaryReader: Attempt to read past end of buffer");
-		}
-
-		T value;
-
-		if (!IS_BIG_ENDIAN) {
-			memcpy(&value, ptr, sizeof(T));
-		} else {
-			// Handle big-endian reading
-			char buffer[sizeof(T)];
-			for (size_t i = 0; i < sizeof(T); i++) {
-				buffer[i] = ptr[sizeof(T) - 1 - i];
-			}
-			memcpy(&value, buffer, sizeof(T));
-		}
-
-		ptr += sizeof(T);
-
-		return value;
-	}
-
-	template<class T>
-	T Read(bool is_big_endian) {
-		return is_big_endian ? Read<T, true>() : Read<T, false>();
-	}
-
-	bool IsAtEnd() const {
-		return ptr >= end;
-	}
-
-	void Reset() {
-		ptr = beg;
-	}
-
-private:
-	const char* beg;
-	const char* ptr;
-	const char* end;
-};
-
-class BinaryWriter {
-public:
-	template<class T>
-	void Write(const T& value) {
-		static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
-		const auto offset = buffer.size();
-		buffer.resize(buffer.size() + sizeof(T));
-		memcpy(buffer.data() + offset, &value, sizeof(T));
-	}
-
-	void Reserve(size_t size) {
-		buffer.reserve(buffer.size() + size);
-	}
-
-	void Copy(const char* data, size_t size) {
-		buffer.insert(buffer.end(), data, data + size);
-	}
-
-	template<class T>
-	void CopyTemplated(const char* data, size_t count) {
-		// We're allocating into the vector anyway
-		Copy(data, sizeof(T) * count);
-	}
-
-	void Reset() {
-		buffer.clear();
-	}
-	const char* GetData() const {
-		return buffer.data();
-	}
-	size_t GetSize() const {
-		return buffer.size();
-	}
-
-	size_t GetPosition() const {
-		return buffer.size();
-	}
-
-private:
-	vector<char> buffer;
-};
-
-template<bool SAFE = true>
-class FixedBinaryWriter {
-public:
-	FixedBinaryWriter(char* data, size_t size)
-	    : beg(data), ptr(beg), end(beg + size) {
-	}
-
-	template<class T>
-	void Write(const T &value) {
-		if (SAFE && ptr + sizeof(T) > end) {
-			throw InvalidInputException("FixedBinaryWriter: Attempt to write past end of buffer");
-		}
-		memcpy(ptr, &value, sizeof(T));
-		ptr += sizeof(T);
-	}
-
-	void Copy(const char* data, size_t size) {
-		if (SAFE && ptr + size > end) {
-			throw InvalidInputException("FixedBinaryWriter: Attempt to copy past end of buffer");
-		}
-		memcpy(ptr, data, size);
-		ptr += size;
-	}
-
-	template<class T>
-	void CopyTemplated(const char* data, size_t count) {
-		if (SAFE && ptr + sizeof(T) * count > end) {
-			throw InvalidInputException("FixedBinaryWriter: Attempt to copy past end of buffer");
-		}
-		for (size_t i = 0; i < count; i++) {
-			memcpy(ptr + sizeof(T) * i, data + sizeof(T) * i, sizeof(T));
-		}
-		ptr += sizeof(T) * count;
-	}
-
-	size_t GetPosition() const {
-		return ptr - beg;
-	}
-
-	void Skip(size_t size) {
-		if (SAFE && ptr + size > end) {
-			throw InvalidInputException("FixedBinaryWriter: Attempt to skip past end of buffer");
-		}
-		ptr += size;
-	}
-
-private:
-	char* beg;
-	char* ptr;
-	char* end;
-};
-
-
-
-// Geometry Type Enum
-enum class GeometryType : uint8_t {
-	INVALID = 0,
-	POINT = 1,
-	LINESTRING = 2,
-	POLYGON = 3,
-	MULTIPOINT = 4,
-	MULTILINESTRING = 5,
-	MULTIPOLYGON = 6,
-	GEOMETRYCOLLECTION = 7,
-};
-
-enum class VertexType : uint8_t {
-	XY = 0,
-	XYZ = 1,
-	XYM = 2,
-	XYZM = 3,
-};
-
-struct VertexXY {
-	static constexpr auto TYPE = VertexType::XY;
-	static constexpr auto HAS_Z = false;
-	static constexpr auto HAS_M = false;
-	double x;
-	double y;
-};
-
-struct VertexXYZ {
-	static constexpr auto TYPE = VertexType::XYZ;
-	static constexpr auto HAS_Z = true;
-	static constexpr auto HAS_M = false;
-	double x;
-	double y;
-	double z;
-};
-
-struct VertexXYM {
-	static constexpr auto TYPE = VertexType::XYM;
-	static constexpr auto HAS_Z = false;
-	static constexpr auto HAS_M = true;
-	double x;
-	double y;
-	double m;
-
-};
-
-struct VertexXYZM {
-	static constexpr auto TYPE = VertexType::XYZM;
-	static constexpr auto HAS_Z = true;
-	static constexpr auto HAS_M = true;
-	double x;
-	double y;
-	double z;
-	double m;
-};
 
 struct BKBMeta {
 	uint8_t meta[4];
@@ -306,18 +81,31 @@ struct OKBMeta {
 		}
 	}
 
-	OKBMeta GetPart(const char* ptr, uint32_t index) const {
-		D_ASSERT(index < length);
+	OKBMeta GetPart(const char* ptr, const char* end, uint32_t index) const {
+		if (ptr + offset + (index * sizeof(OKBMeta)) + sizeof(OKBMeta) > end) {
+			throw InvalidInputException("OKBMeta: Attempt to read part past end of buffer");
+		}
 		OKBMeta meta;
 		memcpy(&meta, ptr + offset + (index * sizeof(OKBMeta)), sizeof(OKBMeta));
 		return meta;
 	}
 
-	VertexXY GetVertexXY(const char* ptr, uint32_t index) const {
-		D_ASSERT(!HasZ() && !HasM());
-		D_ASSERT(index < length);
+	VertexXY GetVertexXY(const char* ptr, const char* end, uint32_t index) const {
+		if (ptr + offset + (index * sizeof(VertexXY)) + sizeof(VertexXY) > end) {
+			throw InvalidInputException("OKBMeta: Attempt to read vertex past end of buffer");
+		}
 		VertexXY vertex;
 		memcpy(&vertex, ptr + offset + (index * sizeof(VertexXY)), sizeof(VertexXY));
+		return vertex;
+	}
+
+	template<class V = VertexXY>
+	V GetVertex(const char* ptr, const char* end, uint32_t index) const {
+		if (ptr + offset + (index * sizeof(V)) + sizeof(V) > end) {
+			throw InvalidInputException("OKBMeta: Attempt to read vertex past end of buffer");
+		}
+		V vertex;
+		memcpy(&vertex, ptr + offset + (index * sizeof(V)), sizeof(V));
 		return vertex;
 	}
 
@@ -1613,13 +1401,13 @@ struct ST_Extent {
 		}
 	}
 
-	static uint32_t TraverseOKB(const char* root, OKBMeta &okb, double &xmin, double &ymin, double &xmax, double &ymax) {
+	static uint32_t TraverseOKB(const char* root, const char* end, OKBMeta &okb, double &xmin, double &ymin, double &xmax, double &ymax) {
 		switch (okb.GetType()) {
 			case GeometryType::POINT:
 			case GeometryType::LINESTRING: {
 				const auto vert_count = okb.GetLength();
 				for (uint32_t i = 0; i < vert_count; i++) {
-					auto vert = okb.GetVertexXY(root, i);
+					auto vert = okb.GetVertexXY(root, end, i);
 					xmin = std::min(xmin, vert.x);
 					ymin = std::min(ymin, vert.y);
 					xmax = std::max(xmax, vert.x);
@@ -1636,8 +1424,8 @@ struct ST_Extent {
 				uint32_t total_vertices = 0;
 				const auto part_count = okb.GetLength();
 				for (uint32_t i = 0; i < part_count; i++) {
-					auto part = okb.GetPart(root, i);
-					total_vertices += TraverseOKB(root, part, xmin, ymin, xmax, ymax);
+					auto part = okb.GetPart(root, end, i);
+					total_vertices += TraverseOKB(root, end, part, xmin, ymin, xmax, ymax);
 				}
 				return total_vertices;
 			} break;
@@ -1689,7 +1477,7 @@ struct ST_Extent {
 			*/
 				OKBMeta part;
 				memcpy(&part, blob_ptr, sizeof(OKBMeta));
-				if (TraverseOKB(blob_ptr, part, min_x, min_y, max_x, max_y) == 0) {
+				if (TraverseOKB(blob_ptr, blob_ptr + blob_len, part, min_x, min_y, max_x, max_y) == 0) {
 					FlatVector::SetNull(result, out_idx, true);
 					continue;
 				}
@@ -2004,7 +1792,7 @@ struct ST_AsWKB {
 		result.Reinterpret(args.data[0]);
 	}
 
-	static void GetOKBSize(const char* root, const OKBMeta &part, uint32_t &total_size) {
+	static void GetOKBSize(const char* root, const char* end, const OKBMeta &part, uint32_t &total_size) {
 		switch (part.GetType()) {
 			case GeometryType::POINT: {
 				const auto vertex_width = (2 + part.HasZ() + part.HasM()) * sizeof(double);
@@ -2018,7 +1806,7 @@ struct ST_AsWKB {
 			case GeometryType::POLYGON: {
 				total_size += 1 + 4 + 4; // 1 byte for byte order, 4 bytes for type, 4 bytes for ring count
 				for (uint32_t i = 0; i < part.GetLength(); i++) {
-					auto ring = part.GetPart(root, i);
+					auto ring = part.GetPart(root, end, i);
 					const auto vertex_width = (2 + ring.HasZ() + ring.HasM()) * sizeof(double);
 					const auto vertex_count = ring.GetLength();
 					total_size += 4 + vertex_count * vertex_width; // 4 bytes for vertex count, vertex data
@@ -2029,8 +1817,8 @@ struct ST_AsWKB {
 			case GeometryType::GEOMETRYCOLLECTION: {
 				total_size += 1 + 4 + 4; // 1 byte for byte order, 4 bytes for type, 4 bytes for count
 				for (uint32_t i = 0; i < part.GetLength(); i++) {
-					auto sub_part = part.GetPart(root, i);
-					GetOKBSize(root, sub_part, total_size);
+					auto sub_part = part.GetPart(root, end, i);
+					GetOKBSize(root, end, sub_part, total_size);
 				}
 			} break;
 			default:
@@ -2038,7 +1826,7 @@ struct ST_AsWKB {
 		}
 	}
 
-	static void FromOKB(const char* root, const OKBMeta &part, FixedBinaryWriter<false> &writer) {
+	static void FromOKB(const char* root, const char* end, const OKBMeta &part, FixedBinaryWriter<false> &writer) {
 		writer.Write<uint8_t>(0x01); // Little-endian byte order
 
 		const auto type = static_cast<uint32_t>(part.GetType()) + (part.HasZ() ? 1000 : 0) + (part.HasM() ? 2000 : 0);
@@ -2070,7 +1858,7 @@ struct ST_AsWKB {
 				const auto ring_count = part.GetLength();
 				writer.Write(ring_count);
 				for (uint32_t i = 0; i < ring_count; i++) {
-					auto ring = part.GetPart(root, i);
+					auto ring = part.GetPart(root, end, i);
 					const auto vertex_width = (2 + ring.HasZ() + ring.HasM()) * sizeof(double);
 					const auto vertex_count = ring.GetLength();
 					writer.Write(vertex_count);
@@ -2084,8 +1872,8 @@ struct ST_AsWKB {
 				const auto count = part.GetLength();
 				writer.Write(count);
 				for (uint32_t i = 0; i < count; i++) {
-					auto sub_part = part.GetPart(root, i);
-					FromOKB(root, sub_part, writer);
+					auto sub_part = part.GetPart(root, end, i);
+					FromOKB(root, end, sub_part, writer);
 				}
 			} break;
 			default:
@@ -2100,11 +1888,11 @@ struct ST_AsWKB {
 				OKBMeta part;
 				memcpy(&part, input.GetData(), sizeof(OKBMeta));
 				uint32_t total_size = 0;
-				GetOKBSize(input.GetData(), part, total_size);
+				GetOKBSize(input.GetData(), input.GetData() + input.GetSize(), part, total_size);
 
 				auto blob = StringVector::EmptyString(result, total_size);
 				FixedBinaryWriter<false> writer(blob.GetDataWriteable(), blob.GetSize());
-				FromOKB(input.GetData(), part, writer);
+				FromOKB(input.GetData(), input.GetData() + input.GetSize(), part, writer);
 				blob.Finalize();
 				return blob;
 			});
@@ -2231,7 +2019,7 @@ struct ST_Area {
 
 								double sum = 0.0;
 
-								if (reader.IsAligned()) {
+								if (false && reader.IsAligned()) {
 									const auto vertex_ptr = reinterpret_cast<const VertexXYM*>(vertex_array);
 									for (uint32_t vertex_idx = 0; vertex_idx < vertex_count - 1; vertex_idx++) {
 										const auto &v1 = vertex_ptr[vertex_idx];
@@ -2250,11 +2038,11 @@ struct ST_Area {
 									 }
 								}
 
-								sum = std::abs(sum) * 0.5;
+
 								if (ring_idx == 0) {
-									total_area += sum; // Add the area of the first ring
+									total_area += std::abs(sum) * 0.5; // First ring adds area
 								} else {
-									total_area -= sum; // Subtract the area of subsequent rings
+									total_area -= std::abs(sum) * 0.5; // Subsequent rings subtract area
 								}
 							}
 						} break;
@@ -2338,20 +2126,20 @@ struct ST_Area {
 			});
 	}
 
-	static void ExecuteOBKRecursive(const char* root, OKBMeta &part, double &result) {
+	static void ExecuteOBKRecursive(const char* root, const char* end, OKBMeta &part, double &result) {
 		switch (part.GetType()) {
 		case GeometryType::POLYGON: {
 			const auto ring_count = part.GetLength();
 			for (uint32_t i = 0; i < ring_count; i++) {
-				auto ring = part.GetPart(root, i);
+				auto ring = part.GetPart(root, end, i);
 				const auto vertex_count = ring.GetLength();
 				if (vertex_count < 3) {
 					continue; // Not enough vertices to form a polygon
 				}
 				double sum = 0.0;
 				for (uint32_t vertex_idx = 0; vertex_idx < vertex_count - 1; vertex_idx++) {
-					const auto v1 = ring.GetVertexXY(root, vertex_idx);
-					const auto v2 = ring.GetVertexXY(root, vertex_idx + 1);
+					const auto v1 = ring.GetVertexXY(root, end, vertex_idx);
+					const auto v2 = ring.GetVertexXY(root, end, vertex_idx + 1);
 					sum += (v1.x * v2.y) - (v2.x * v1.y);
 				}
 				sum = std::abs(sum) * 0.5;
@@ -2366,8 +2154,8 @@ struct ST_Area {
 		case GeometryType::GEOMETRYCOLLECTION: {
 			const auto part_count = part.GetLength();
 			for (uint32_t i = 0; i < part_count; i++) {
-				auto sub_part = part.GetPart(root, i);
-				ExecuteOBKRecursive(root, sub_part, result);
+				auto sub_part = part.GetPart(root, end, i);
+				ExecuteOBKRecursive(root, end, sub_part, result);
 			}
 		} break;
 		default:
@@ -2384,7 +2172,7 @@ struct ST_Area {
 			memcpy(&root, input.GetData(), sizeof(OKBMeta));
 			double total_area = 0.0;
 
-			ExecuteOBKRecursive(input.GetData(), root, total_area);
+			ExecuteOBKRecursive(input.GetData(), input.GetData() + input.GetSize(), root, total_area);
 
 			return total_area;
 		});
@@ -2619,13 +2407,91 @@ struct ST_FlipCoordinates {
 			});
 	}
 
+
+	static void ExecuteOKBRecursive(const char* root, const char* end, OKBMeta &part, FixedBinaryWriter<false> &writer) {
+		switch (part.GetType()) {
+			case GeometryType::POINT:
+			case GeometryType::LINESTRING: {
+				const auto vertex_count = part.GetLength();
+				const auto vertex_parts = static_cast<VertexType>(part.HasZ() + (part.HasM() * 2));
+
+				switch (vertex_parts) {
+				case VertexType::XY: {
+					for (uint32_t i = 0; i < vertex_count; i++) {
+						auto v = part.GetVertex<VertexXY>(root, end, i);
+						std::swap(v.x, v.y);
+						writer.Write(v);
+					}
+				} break;
+				case VertexType::XYM: {
+					for (uint32_t i = 0; i < vertex_count; i++) {
+						auto v = part.GetVertex<VertexXYM>(root, end, i);
+						std::swap(v.x, v.y);
+						writer.Write(v);
+					}
+				} break;
+				case VertexType::XYZ: {
+					for (uint32_t i = 0; i < vertex_count; i++) {
+						auto v = part.GetVertex<VertexXYZ>(root, end, i);
+						std::swap(v.x, v.y);
+						writer.Write(v);
+					}
+				} break;
+				case VertexType::XYZM: {
+					for (uint32_t i = 0; i < vertex_count; i++) {
+						auto v = part.GetVertex<VertexXYZM>(root, end, i);
+						std::swap(v.x, v.y);
+						writer.Write(v);
+					}
+				} break;
+				default:
+					throw InvalidInputException("GeometryVisitor: Unknown vertex type %d", static_cast<int>(vertex_parts));
+				}
+			} break;
+			case GeometryType::POLYGON:
+			case GeometryType::MULTIPOINT:
+			case GeometryType::MULTILINESTRING:
+			case GeometryType::MULTIPOLYGON:
+			case GeometryType::GEOMETRYCOLLECTION: {
+				const auto part_count = part.GetLength();
+
+				auto part_writer = writer;
+				writer.Skip(part_count * sizeof(OKBMeta)); // Reserve space for the parts
+
+				for (uint32_t i = 0; i < part_count; i++) {
+					auto sub_part = part.GetPart(root, end, i);
+					part_writer.Write(sub_part);
+					ExecuteOKBRecursive(root, end, sub_part, writer);
+				}
+			} break;
+			default:
+				throw InvalidInputException("Unknown meta type %d", static_cast<int>(part.GetType()));
+		}
+	}
+
+	static void ExecuteOKB(DataChunk &args, ExpressionState &state, Vector &result) {
+		UnaryExecutor::Execute<string_t, string_t>(
+			args.data[0], result, args.size(),
+			[&](const string_t &input) {
+				OKBMeta part;
+				memcpy(&part, input.GetData(), sizeof(OKBMeta));
+
+				auto blob = StringVector::EmptyString(result, input.GetSize());
+				FixedBinaryWriter<false> writer(blob.GetDataWriteable(), blob.GetSize());
+				writer.Write(part);
+				ExecuteOKBRecursive(input.GetData(), input.GetData() + input.GetSize(), part, writer);
+				blob.Finalize();
+				return blob;
+			});
+	}
+
 	static void Register(DatabaseInstance &db) {
 		ScalarFunctionSet set("st_flip");
 		set.AddFunction(ScalarFunction({Types::BKB()}, Types::BKB(), ExecuteBKB));
 		set.AddFunction(ScalarFunction({Types::WKB()}, Types::WKB(), ExecuteWKB));
+		set.AddFunction(ScalarFunction({Types::OKB()}, Types::OKB(), ExecuteOKB));
 		ExtensionUtil::RegisterFunction(db, std::move(set));
 	}
-
 };
 
 } // namespace
